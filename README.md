@@ -36,6 +36,9 @@ Ultimate Universal Downloader (UUD) is a state-of-the-art desktop application bu
 | **WeebCentral** | `weebcentral.com` | Manga / Manhwa | Images | `https://weebcentral.com/series/0123/example` |
 | **X / Twitter** | `x.com`, `twitter.com` | Social Media | Video & GIF | `https://x.com/user/status/12345` |
 
+> [!NOTE]
+> This is just a starting point! **Many more website supports can be easily added with your own custom plugins.** See the [A-Z Tutorial: How to Write Plugins](#-a-z-tutorial-how-to-write-plugins) section below.
+
 ---
 
 ## 🔬 Comprehensive Technical Architecture
