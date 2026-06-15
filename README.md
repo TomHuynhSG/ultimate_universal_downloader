@@ -2,6 +2,8 @@
 
 Ultimate Universal Downloader (UUD) is a state-of-the-art desktop application built with Python and React designed to effortlessly download media (images, gifs, files, videos) from virtually any website. Built for extreme concurrency and resilience, it bypasses modern WAFs (Web Application Firewalls) and anti-bot protections like Cloudflare and Turnstile.
 
+![Ultimate Universal Downloader Dashboard](screenshots/main-app.jpg)
+
 ## 🚀 Features
 
 * **Sleek Desktop UI:** A gorgeous, responsive React + TailwindCSS (vanilla CSS module) frontend bundled into a native desktop window via `pywebview`.
