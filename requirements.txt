@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pywebview
+curl_cffi
+playwright
+yt-dlp
+sqlalchemy

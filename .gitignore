@@ -1,0 +1,45 @@
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pywebview and Playwright
+*.log
+*.sqlite
+playwright-log/
+
+# Node and Vite
+frontend/node_modules/
+frontend/dist/
+frontend/.npm/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Project specific
+downloads/
+settings.json
+downloads.db
+task_logs/
+
+# Scratch and test files
+scratch_*.py
+step*.py
+*.html
+*.png
+gg.js
+common.js
+
