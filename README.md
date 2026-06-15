@@ -37,7 +37,7 @@ Ultimate Universal Downloader (UUD) is a state-of-the-art desktop application bu
 | **X / Twitter** | `x.com`, `twitter.com` | Social Media | Video & GIF | `https://x.com/user/status/12345` |
 
 > [!NOTE]
-> This is just a starting point! **Many more website supports can be easily added with your own custom plugins.** See the [A-Z Tutorial: How to Write Plugins](#-a-z-tutorial-how-to-write-plugins) section below.
+> This is just a starting point! **Many more website supports can be easily added with your own custom plugins.** See the [A-Z Tutorial: How to Write Plugins](#-a-z-tutorial-how-to-write-plugins) section below. For an example of how a plugin is structured, check out the existing [MangaHere Plugin](https://github.com/TomHuynhSG/ultimate_universal_downloader/blob/main/plugins/mangahere.py) or the [WeebCentral Plugin](https://github.com/TomHuynhSG/ultimate_universal_downloader/blob/main/plugins/weebcentral.py).
 
 ---
 
