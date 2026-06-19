@@ -138,6 +138,38 @@ function App() {
     return () => window.removeEventListener('paste', handleGlobalPaste);
   }, []);
 
+  useEffect(() => {
+    const handleWheel = (e) => {
+      if (e.ctrlKey) {
+        e.preventDefault();
+        setSettings(prev => {
+          let newScale = prev.ui_scale || 1.0;
+          if (e.deltaY < 0) {
+            newScale = Math.min(newScale + 0.1, 1.5);
+          } else {
+            newScale = Math.max(newScale - 0.1, 0.5);
+          }
+          newScale = parseFloat(newScale.toFixed(1));
+          
+          if (newScale !== prev.ui_scale) {
+             const newSettings = { ...prev, ui_scale: newScale };
+             setDraftSettings(newSettings);
+             fetch('http://127.0.0.1:8000/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(newSettings)
+             }).catch(err => console.error("Failed to save scale", err));
+             return newSettings;
+          }
+          return prev;
+        });
+      }
+    };
+
+    window.addEventListener('wheel', handleWheel, { passive: false });
+    return () => window.removeEventListener('wheel', handleWheel);
+  }, []);
+
   const handleDownload = async (e) => {
     e.preventDefault();
     if (!url) return;

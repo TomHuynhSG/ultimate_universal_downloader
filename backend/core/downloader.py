@@ -78,6 +78,16 @@ class DownloadManager:
                     if extractor:
                         log_to_file(f"Matched plugin: {extractor.__class__.__name__}")
                         extracted_urls = await extractor.extract(session)
+                        
+                        # System-Level Path Sanitization: Apply strict limits to prevent OS path length crashes
+                        for img_item in extracted_urls:
+                            if isinstance(img_item, dict) and img_item.get("folder"):
+                                safe_sub = re.sub(r'[\\/*?:"<>|]', "", img_item["folder"]).strip()
+                                if len(safe_sub) > 175:
+                                    safe_sub = safe_sub[:100].strip() + "..." + safe_sub[-72:]
+                                safe_sub = safe_sub.rstrip('. ') # Windows hates trailing dots/spaces in folder names
+                                img_item["folder"] = safe_sub
+                                
                         task.status = "downloading"
                         task.title = extractor.title
                         task.thumbnail = getattr(extractor, "thumbnail", None)
@@ -123,7 +133,9 @@ class DownloadManager:
                             
                         from backend.core.config import get_settings
                         settings = get_settings()
-                        base_dir = settings.get("download_dir", os.path.join(os.getcwd(), "downloads"))
+                        base_dir = settings.get("download_dir")
+                        if not base_dir:
+                            base_dir = os.path.join(os.getcwd(), "downloads")
                         max_items = settings.get("max_concurrent_items", 5)
                         sem = asyncio.Semaphore(max_items)
                         
@@ -131,6 +143,9 @@ class DownloadManager:
                             download_dir = base_dir
                         else:
                             safe_title = re.sub(r'[\\/*?:"<>|]', "", extractor.title).strip()
+                            if len(safe_title) > 175:
+                                safe_title = safe_title[:100].strip() + "..." + safe_title[-72:]
+                            safe_title = safe_title.rstrip('. ')
                             download_dir = os.path.join(base_dir, safe_title)
                         
                         os.makedirs(download_dir, exist_ok=True)
@@ -181,6 +196,11 @@ class DownloadManager:
                                         url_no_query = img_url.split("?")[0] if "?" in img_url else img_url
                                         if url_no_query.split("/")[-1].endswith(('.jpg', '.png', '.jpeg', '.webp', '.avif', '.mp4', '.gif')):
                                             filename = url_no_query.split("/")[-1]
+                                            
+                                    # Globally sanitize filenames for length and invalid characters
+                                    filename = re.sub(r'[\\/*?:"<>|]', "", filename).strip()
+                                    if len(filename) > 80:
+                                        filename = filename[:60].strip() + "_" + filename[-15:]
                                             
                                     target_dir = os.path.join(download_dir, subfolder)
                                     file_path = os.path.join(target_dir, filename)
