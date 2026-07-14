@@ -34,6 +34,7 @@ downloads/
 settings.json
 downloads.db
 task_logs/
+browser_profiles/
 
 # Scratch and test files
 scratch_*.py

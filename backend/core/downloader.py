@@ -70,6 +70,9 @@ class DownloadManager:
             try:
                 task = db.query(DownloadTask).filter(DownloadTask.id == task_id).first()
                 if task:
+                    if task.status in ["deleted", "cancelled"]:
+                        log_to_file("Task was deleted while waiting in the queue. Skipping.")
+                        return
                     task.status = "extracting"
                     db.commit()
 
@@ -78,7 +81,14 @@ class DownloadManager:
                     if extractor:
                         log_to_file(f"Matched plugin: {extractor.__class__.__name__}")
                         extracted_urls = await extractor.extract(session)
-                        
+
+                        # The task may have been deleted from the UI while extraction was running.
+                        # Re-read the status so we don't overwrite "deleted" and resurrect the task.
+                        db.refresh(task)
+                        if task.status in ["deleted", "cancelled"]:
+                            log_to_file("Task was deleted during extraction. Aborting before download.")
+                            return
+
                         # System-Level Path Sanitization: Apply strict limits to prevent OS path length crashes
                         for img_item in extracted_urls:
                             if isinstance(img_item, dict) and img_item.get("folder"):

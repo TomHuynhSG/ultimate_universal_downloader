@@ -31,17 +31,9 @@ class HitomiExtractor(BaseExtractor):
                 # Rejoin all but the last part (which is the artist name)
                 raw_title = " by ".join(parts[:-1])
                 
-            if len(raw_title) > 150:
-                raw_title = raw_title[:150].strip() + "..."
-                
             artist_str = ", ".join([a.title() for a in artists])
-            if len(artist_str) > 50:
-                artist_str = artist_str[:50].strip() + "..."
-                
             gallery_title = f"{raw_title} by {artist_str} ({gallery_id})"
         else:
-            if len(raw_title) > 150:
-                raw_title = raw_title[:150].strip() + "..."
             gallery_title = f"{raw_title} ({gallery_id})"
             
         if not is_sub:
@@ -57,6 +49,13 @@ class HitomiExtractor(BaseExtractor):
             pass
             
         reader_url = f"https://hitomi.la/reader/{gallery_id}.html#1"
+        await page.goto(reader_url, wait_until="domcontentloaded")
+        
+        # Wait until galleryinfo is loaded into the window
+        try:
+            await page.wait_for_function("typeof galleryinfo !== 'undefined'", timeout=15000)
+        except Exception:
+            pass
         
         js_eval = f"""
         () => {{
@@ -74,34 +73,17 @@ class HitomiExtractor(BaseExtractor):
             return items;
         }}
         """
-        
-        image_urls = []
-        max_retries = 5
-        for attempt in range(max_retries):
-            await page.goto(reader_url, wait_until="domcontentloaded")
-            try:
-                await page.wait_for_function("typeof galleryinfo !== 'undefined'", timeout=15000)
-                image_urls = await page.evaluate(js_eval)
-                if image_urls:
-                    break
-            except Exception:
-                pass
-                
-            if attempt < max_retries - 1:
-                import asyncio
-                await asyncio.sleep(5 * (attempt + 1))
-                
-        if not image_urls:
-            raise Exception("Failed to evaluate hitomi JS: galleryinfo was missing. The site might be serving an HTTP 503 rate-limit page or Cloudflare challenge.")
-            
-        if is_sub:
-            import re as regex
-            folder = regex.sub(r'[\\/*?:"<>|]', "", gallery_title).strip()
-            if len(folder) > 200:
-                folder = folder[:200].strip()
-            for img in image_urls:
-                img['folder'] = folder
-        return image_urls
+        try:
+            image_urls = await page.evaluate(js_eval)
+            if is_sub:
+                import re as regex
+                folder = regex.sub(r'[\\/*?:"<>|]', "", gallery_title).strip()
+                for img in image_urls:
+                    img['folder'] = folder
+            return image_urls
+        except Exception as e:
+            print(f"Failed to evaluate hitomi JS: {e}")
+            return []
 
     async def extract(self, session):
         is_collection = not re.search(r'-(?:\d+)\.html|/galleries/(?:\d+)\.html|/reader/(?:\d+)\.html', self.url)
