@@ -1,28 +1,30 @@
 import yt_dlp
 
+
 class MediaProcessor:
     @staticmethod
     def extract_info(url):
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': True
+        options = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": True,
+            "noplaylist": True,
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
-                info = ydl.extract_info(url, download=False)
-                return info
-            except Exception as e:
-                print(f"yt-dlp error: {e}")
-                return None
+        with yt_dlp.YoutubeDL(options) as downloader:
+            return downloader.extract_info(url, download=False)
 
     @staticmethod
-    def download_video(url, output_path):
-        ydl_opts = {
-            'outtmpl': output_path,
-            'format': 'bestvideo+bestaudio/best',
-            'merge_output_format': 'mp4',
-            'quiet': True
+    def download_video(url, output_path, headers=None):
+        options = {
+            "outtmpl": output_path,
+            "format": "bestvideo+bestaudio/best",
+            "merge_output_format": "mp4",
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "overwrites": True,
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        if headers:
+            options["http_headers"] = headers
+        with yt_dlp.YoutubeDL(options) as downloader:
+            downloader.download([url])

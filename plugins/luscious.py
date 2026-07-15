@@ -1,137 +1,113 @@
-import asyncio
-from bs4 import BeautifulSoup
 import re
+
+from bs4 import BeautifulSoup
+
+from backend.core.config import get_settings
 from backend.plugins.base import BaseExtractor
+from backend.plugins.utils import bounded_map, deduplicate
+
 
 class LusciousExtractor(BaseExtractor):
-    """
-    Downloads static images and GIFs from luscious.net albums.
-    Bypasses dynamic URL resolutions by probing CDN extensions concurrently.
-    """
-    
     URLS = ["luscious.net", "www.luscious.net", "members.luscious.net"]
 
+    @staticmethod
+    def thumbnails_from_html(page_html):
+        soup = BeautifulSoup(page_html, "html.parser")
+        return [
+            source
+            for image in soup.find_all("img")
+            if (source := image.get("src", ""))
+            and "ah-img.luscious.net" in source
+            and "avatar" not in source.lower()
+        ]
+
     async def extract(self, session):
-        # Initial page load
-        resp = await session.get(self.url)
-        if resp.status_code != 200:
-            raise Exception(f"Failed to fetch Luscious album: HTTP {resp.status_code}. The album may have been deleted.")
-
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        
-        # Extract title
-        h1 = soup.find('h1')
-        title = h1.text.strip() if h1 else "Unknown Album"
-        
-        # Check if URL has an ID for better naming
-        m = re.search(r'_(\d+)(?:/|$)', self.url)
-        if m:
-            title = f"{title} ({m.group(1)})"
+        settings = get_settings()
+        timeout = settings["request_timeout_seconds"]
+        response = await session.get(self.url, timeout=timeout)
+        if response.status_code != 200:
+            raise RuntimeError(f"Luscious returned HTTP {response.status_code}")
+        soup = BeautifulSoup(response.text, "html.parser")
+        heading = soup.find("h1")
+        title = heading.get_text(strip=True) if heading else "Unknown Album"
+        if match := re.search(r"_(\d+)(?:/|$)", self.url):
+            title = f"{title} ({match.group(1)})"
         self.title = title
-        
-        # Find thumbnail to show in UI
-        og_img = soup.find('meta', {'property': 'og:image'})
-        if og_img:
-            self.thumbnail = og_img.get('content')
-            
-        print(f"Extracting Luscious Album: {title}")
-        
-        # Find total number of pages
-        max_page = 1
-        pagination_links = soup.select('.o-pagination-item')
-        for link in pagination_links:
-            text = link.text.strip()
-            if text.isdigit():
-                max_page = max(max_page, int(text))
-                
-        print(f"Found {max_page} pages to parse...")
-        
-        all_thumbnails = []
-        
-        # Helper to parse a single page
-        async def fetch_page(page_num):
-            sep = '&' if '?' in self.url else '?'
-            page_url = f"{self.url}{sep}page={page_num}"
-            
-            p_resp = await session.get(page_url)
-            if p_resp.status_code == 200:
-                p_soup = BeautifulSoup(p_resp.text, 'html.parser')
-                images = p_soup.find_all("img")
-                for img in images:
-                    src = img.get("src", "")
-                    if "ah-img.luscious.net" in src and "avatar" not in src.lower():
-                        all_thumbnails.append(src)
+        if image := soup.find("meta", {"property": "og:image"}):
+            self.thumbnail = image.get("content")
 
-        # 1. Parse page 1 (we already have it)
-        images = soup.find_all("img")
-        for img in images:
-            src = img.get("src", "")
-            if "ah-img.luscious.net" in src and "avatar" not in src.lower():
-                all_thumbnails.append(src)
-                
-        # 2. Concurrently fetch the rest of the HTML pages
-        if max_page > 1:
-            page_tasks = [fetch_page(p) for p in range(2, max_page + 1)]
-            await asyncio.gather(*page_tasks)
-            
-        # Deduplicate preserving order
-        seen = set()
-        unique_thumbnails = []
-        for thumb in all_thumbnails:
-            if thumb not in seen:
-                seen.add(thumb)
-                unique_thumbnails.append(thumb)
-                
-        print(f"Discovered {len(unique_thumbnails)} media items. Probing CDNs...")
-        
-        final_urls = []
-        probe_semaphore = asyncio.Semaphore(30) # Prevent hammering the CDN
-        
-        async def probe_url(idx, thumb_url):
-            async with probe_semaphore:
-                # Strip thumbnail modifiers like .315x0.jpg or .640x0.jpg
-                base_url = re.sub(r'\.\d+x\d+\.jpg$', '', thumb_url)
-                
-                # Check GIF first (since user specifically requested GIF support and it's a common case)
-                gif_url = f"{base_url}.gif"
-                head_resp = await session.head(gif_url)
-                if head_resp.status_code == 200:
-                    filename = f"{idx+1:03d}.gif"
-                    final_urls.append({"url": gif_url, "filename": filename, "idx": idx})
-                    return
-                
-                # Check MP4 if it's animated but GIF failed (Luscious sometimes uses MP4 for animations)
-                mp4_url = f"{base_url}.mp4"
-                head_resp = await session.head(mp4_url)
-                if head_resp.status_code == 200:
-                    filename = f"{idx+1:03d}.mp4"
-                    final_urls.append({"url": mp4_url, "filename": filename, "idx": idx})
-                    return
-                
-                # Check standard JPG
-                jpg_url = f"{base_url}.jpg"
-                head_resp = await session.head(jpg_url)
-                if head_resp.status_code == 200:
-                    filename = f"{idx+1:03d}.jpg"
-                    final_urls.append({"url": jpg_url, "filename": filename, "idx": idx})
-                    return
-                    
-                # Check PNG
-                png_url = f"{base_url}.png"
-                head_resp = await session.head(png_url)
-                if head_resp.status_code == 200:
-                    filename = f"{idx+1:03d}.png"
-                    final_urls.append({"url": png_url, "filename": filename, "idx": idx})
-                    return
-                    
-                # Fallback, just use original thumbnail
-                final_urls.append({"url": thumb_url, "filename": f"{idx+1:03d}_thumb.jpg", "idx": idx})
-                
-        # Fire off all probes concurrently
-        probe_tasks = [probe_url(i, thumb) for i, thumb in enumerate(unique_thumbnails)]
-        await asyncio.gather(*probe_tasks)
-        
-        # Sort back to original index order
-        final_urls.sort(key=lambda x: x["idx"])
-        
-        return final_urls
+        max_page = max(
+            [1]
+            + [
+                int(link.get_text(strip=True))
+                for link in soup.select(".o-pagination-item")
+                if link.get_text(strip=True).isdigit()
+            ]
+        )
+
+        async def fetch_page(page_number):
+            separator = "&" if "?" in self.url else "?"
+            page = await session.get(
+                f"{self.url}{separator}page={page_number}", timeout=timeout
+            )
+            if page.status_code != 200:
+                raise RuntimeError(f"Luscious page {page_number} returned HTTP {page.status_code}")
+            return self.thumbnails_from_html(page.text)
+
+        page_results = await bounded_map(
+            range(2, max_page + 1),
+            fetch_page,
+            limit=min(6, settings["max_extract_concurrency"]),
+            return_exceptions=True,
+        )
+        self.extraction_errors = [
+            str(result) for result in page_results if isinstance(result, Exception)
+        ]
+        thumbnails = self.thumbnails_from_html(response.text)
+        thumbnails.extend(
+            value for result in page_results if isinstance(result, list) for value in result
+        )
+        thumbnails = deduplicate(thumbnails)
+        if not thumbnails:
+            raise RuntimeError("No Luscious media thumbnails were found")
+
+        async def probe(index_and_url):
+            index, thumbnail = index_and_url
+            base = re.sub(r"\.\d+x\d+\.jpg$", "", thumbnail)
+            for extension in ("gif", "mp4", "jpg", "png"):
+                candidate = f"{base}.{extension}"
+                try:
+                    head = await session.head(candidate, timeout=timeout)
+                    if head.status_code == 200:
+                        return {
+                            "url": candidate,
+                            "filename": f"{index + 1:03d}.{extension}",
+                            "referer": self.url,
+                        }
+                except Exception:
+                    continue
+            return {
+                "url": thumbnail,
+                "filename": f"{index + 1:03d}_thumb.jpg",
+                "referer": self.url,
+            }
+
+        async def progress(completed, total, errors):
+            await self.report_progress(
+                phase="probing", completed=completed, total=total, errors=errors
+            )
+
+        results = await bounded_map(
+            list(enumerate(thumbnails)),
+            probe,
+            limit=min(20, settings["max_extract_concurrency"]),
+            return_exceptions=True,
+            on_progress=progress,
+        )
+        self.extraction_errors.extend(
+            str(result) for result in results if isinstance(result, Exception)
+        )
+        media = [result for result in results if isinstance(result, dict)]
+        if not media:
+            raise RuntimeError("Every Luscious CDN probe failed")
+        return media

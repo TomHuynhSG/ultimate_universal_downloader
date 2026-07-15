@@ -40,7 +40,7 @@ browser_profiles/
 scratch_*.py
 step*.py
 *.html
+!frontend/index.html
 *.png
 gg.js
 common.js
-

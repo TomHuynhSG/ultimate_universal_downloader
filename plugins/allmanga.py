@@ -1,6 +1,7 @@
 import re
 import urllib.parse
 from backend.plugins.base import BaseExtractor
+from backend.plugins.utils import bounded_map
 from playwright.async_api import async_playwright
 import json
 
@@ -202,8 +203,7 @@ class AllMangaExtractor(BaseExtractor):
                 async with sem:
                     return await self.extract_single(session, manga_id, chap)
                     
-            tasks = [fetch_chapter(c) for c in available_chapters]
-            results = await asyncio.gather(*tasks)
+            results = await bounded_map(available_chapters, fetch_chapter, limit=5)
             
             for res in results:
                 all_items.extend(res)

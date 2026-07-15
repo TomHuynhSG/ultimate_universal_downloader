@@ -81,8 +81,8 @@ class WeebCentralExtractor(BaseExtractor):
                             media.append({
                                 "url": src,
                                 "referer": chap_url,
-                                # We can optionally specify a filename format, e.g. "Chapter 41/001.png"
-                                "filename": f"Chapter {len(chapter_links) - chapter_index:03d}/{page_num:03d}.png"
+                                "folder": f"Chapter {len(chapter_links) - chapter_index:03d}",
+                                "filename": f"{page_num:03d}.png"
                             })
                             page_num += 1
                     return media
@@ -95,6 +95,7 @@ class WeebCentralExtractor(BaseExtractor):
             for i, chap_url in enumerate(chapter_links):
                 media = await fetch_chapter_images(chap_url, i)
                 all_media.extend(media)
+                await self.report_progress(phase="extracting", completed=i + 1, total=len(chapter_links), errors=0)
                 # Small delay to respect rate limits
                 await asyncio.sleep(0.5)
                 

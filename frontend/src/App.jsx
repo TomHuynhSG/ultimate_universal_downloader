@@ -1,638 +1,431 @@
-import { useState, useEffect, useRef } from 'react'
-import { Download, PlayCircle, Settings, Layers, Search, Server, Link, X, Pause, Play, Trash2, FolderOpen, Image, HardDrive, Info, RotateCw, XCircle, Clock } from 'lucide-react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  Clock,
+  Download,
+  FolderOpen,
+  HardDrive,
+  Image,
+  Info,
+  Layers,
+  Link,
+  Pause,
+  Play,
+  PlayCircle,
+  RotateCw,
+  Search,
+  Server,
+  Settings,
+  Trash2,
+  XCircle,
+} from 'lucide-react'
 import './index.css'
 
+
+const API_ROOT = '/api'
+const ACTIVE_STATUSES = new Set(['pending', 'extracting', 'downloading', 'paused'])
+const FINISHED_STATUSES = new Set(['completed', 'completed_with_errors', 'error', 'failed'])
+
 const formatBytes = (bytes) => {
-  if (!bytes) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  if (!bytes) return '0 B'
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), sizes.length - 1)
+  return `${parseFloat((bytes / Math.pow(1024, index)).toFixed(2))} ${sizes[index]}`
 }
 
 const formatTime = (seconds) => {
-  if (seconds === undefined || seconds === null || isNaN(seconds)) return '0s';
-  if (seconds < 60) return `${Math.floor(seconds)}s`;
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  if (m < 60) return `${m}m ${s}s`;
-  const h = Math.floor(m / 60);
-  const rm = m % 60;
-  return `${h}h ${rm}m`;
+  if (!Number.isFinite(seconds)) return '0s'
+  if (seconds < 60) return `${Math.floor(seconds)}s`
+  const minutes = Math.floor(seconds / 60)
+  const remainder = Math.floor(seconds % 60)
+  if (minutes < 60) return `${minutes}m ${remainder}s`
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
 }
+
+const taskDetails = (value) => {
+  if (!value) return {}
+  if (typeof value === 'object') return value
+  try {
+    const parsed = JSON.parse(value)
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+const apiFetch = async (path, options) => {
+  const response = await fetch(`${API_ROOT}${path}`, options)
+  if (!response.ok) {
+    let message = `Request failed with HTTP ${response.status}`
+    try {
+      const payload = await response.json()
+      message = payload.detail || message
+    } catch {
+      // The status text above is enough when the server did not return JSON.
+    }
+    throw new Error(message)
+  }
+  return response
+}
+
+const TaskCard = memo(function TaskCard({
+  task,
+  number,
+  onPause,
+  onResume,
+  onRestart,
+  onDelete,
+  onOpen,
+  onLogs,
+  onDeleteChapter,
+}) {
+  const details = useMemo(() => taskDetails(task.details), [task.details])
+  const chapters = useMemo(
+    () => Object.entries(details).filter(([name]) => !name.startsWith('_')),
+    [details],
+  )
+  const meta = details._meta || {}
+  const totals = useMemo(
+    () => chapters.reduce(
+      (result, [, stats]) => ({
+        total: result.total + (stats.total || 0),
+        done: result.done + (stats.done || 0),
+        failed: result.failed + (stats.failed || 0),
+        size: result.size + (stats.size_bytes || 0),
+      }),
+      { total: 0, done: 0, failed: 0, size: 0 },
+    ),
+    [chapters],
+  )
+  const visibleChapters = chapters.slice(0, 60)
+
+  let borderColor = 'rgba(255,255,255,0.05)'
+  if (task.status === 'completed') borderColor = 'rgba(16,185,129,0.6)'
+  if (task.status === 'completed_with_errors') borderColor = 'rgba(234,179,8,0.7)'
+  if (task.status === 'extracting') borderColor = 'rgba(59,130,246,0.6)'
+  if (['error', 'failed'].includes(task.status)) borderColor = 'rgba(239,68,68,0.6)'
+
+  return (
+    <article className="glass-panel" style={{ padding: '1.5rem', border: `3px solid ${borderColor}` }}>
+      <div style={{ display: 'flex', gap: '16px', alignItems: 'center' }}>
+        {task.thumbnail && (
+          <img
+            loading="lazy"
+            src={`${API_ROOT}/proxy?url=${encodeURIComponent(task.thumbnail)}&referer=${encodeURIComponent(task.url)}`}
+            alt="Thumbnail"
+            style={{ flexShrink: 0, width: '96px', height: '128px', borderRadius: '8px', objectFit: 'cover' }}
+          />
+        )}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <h3 style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '4px' }}>
+            <span style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>#{number}</span>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{task.title}</span>
+          </h3>
+          <a href={task.url} target="_blank" rel="noreferrer" style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>
+            {task.url}
+          </a>
+
+          {task.status === 'extracting' && meta.total > 0 && (
+            <p style={{ color: '#60a5fa', marginTop: '8px', fontSize: '0.85rem' }}>
+              Extracting gallery {meta.completed || 0} / {meta.total}
+              {meta.errors ? ` • ${meta.errors} failed` : ''}
+            </p>
+          )}
+
+          <div style={{ height: '6px', marginTop: '12px', background: 'rgba(255,255,255,0.1)', borderRadius: '99px', overflow: 'hidden' }}>
+            <div style={{ width: `${task.progress}%`, height: '100%', background: 'var(--accent-primary)', transition: 'width .25s ease' }} />
+          </div>
+
+          {visibleChapters.length > 0 && (
+            <div style={{ marginTop: '14px', maxHeight: '150px', overflowY: 'auto', display: 'grid', gap: '9px' }}>
+              {visibleChapters.map(([chapter, stats], index) => (
+                <div key={chapter} style={{ fontSize: '0.78rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px' }}>
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      <span style={{ opacity: 0.5, marginRight: '5px' }}>#{index + 1}</span>{chapter}
+                    </span>
+                    <span style={{ flexShrink: 0 }}>
+                      {stats.done || 0} / {stats.total || 0}
+                      {stats.failed ? ` (${stats.failed} failed)` : ''}
+                      <button className="icon-button danger" onClick={() => onDeleteChapter(task.id, chapter)} title="Cancel and delete subtask">
+                        <XCircle size={14} />
+                      </button>
+                    </span>
+                  </div>
+                  <div style={{ height: '4px', background: 'rgba(255,255,255,0.1)', borderRadius: '99px', overflow: 'hidden' }}>
+                    <div style={{ width: `${stats.total ? ((stats.done || 0) / stats.total) * 100 : 0}%`, height: '100%', background: '#60a5fa' }} />
+                  </div>
+                </div>
+              ))}
+              {chapters.length > visibleChapters.length && (
+                <small style={{ color: 'var(--text-muted)' }}>{chapters.length - visibleChapters.length} more subtasks hidden for rendering performance.</small>
+              )}
+            </div>
+          )}
+        </div>
+
+        <aside style={{ flexShrink: 0, textAlign: 'right' }}>
+          <strong>{task.progress}%</strong>
+          <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>{task.status}</p>
+          {totals.total > 0 && <p><Image size={13} /> {totals.done} / {totals.total}</p>}
+          {totals.failed > 0 && <p style={{ color: '#f87171' }}>{totals.failed} failed</p>}
+          {totals.size > 0 && <p><HardDrive size={13} /> {formatBytes(totals.size)}</p>}
+          {task.status === 'downloading' && meta.eta_seconds !== undefined && <p style={{ color: '#10b981' }}><Clock size={13} /> {formatTime(meta.eta_seconds)}</p>}
+          {FINISHED_STATUSES.has(task.status) && meta.total_time_seconds !== undefined && <p><Clock size={13} /> {formatTime(meta.total_time_seconds)}</p>}
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '7px', marginTop: '10px' }}>
+            <button className="icon-button" onClick={() => onLogs(task.id, task.title)} title="Logs"><Info size={16} /></button>
+            <button className="icon-button" onClick={() => onOpen(task.id)} title="Open folder"><FolderOpen size={16} /></button>
+            {task.status === 'downloading' && <button className="icon-button" onClick={() => onPause(task.id)} title="Pause"><Pause size={16} /></button>}
+            {task.status === 'paused' && <button className="icon-button" onClick={() => onResume(task.id)} title="Resume"><Play size={16} /></button>}
+            {FINISHED_STATUSES.has(task.status) && <button className="icon-button" onClick={() => onRestart(task.id)} title="Restart"><RotateCw size={16} /></button>}
+            <button className="icon-button danger" onClick={() => onDelete(task.id)} title="Delete"><Trash2 size={16} /></button>
+          </div>
+        </aside>
+      </div>
+    </article>
+  )
+})
+
+
+function Modal({ children, onClose, width = '500px' }) {
+  return (
+    <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <div className="glass-panel" style={{ width, maxWidth: '92vw', maxHeight: '88vh', overflow: 'auto', padding: '2rem', background: '#0f172a' }}>
+        {children}
+      </div>
+    </div>
+  )
+}
+
 
 function App() {
   const [url, setUrl] = useState('')
   const [downloads, setDownloads] = useState([])
-  const downloadsRef = useRef(downloads)
-  useEffect(() => {
-    downloadsRef.current = downloads
-  }, [downloads])
-  const [status, setStatus] = useState('Idle')
+  const [visibleCount, setVisibleCount] = useState(50)
+  const [connection, setConnection] = useState('Connecting')
+  const [plugins, setPlugins] = useState([])
   const [showPlugins, setShowPlugins] = useState(false)
-  const [pluginsList, setPluginsList] = useState([])
   const [showSettings, setShowSettings] = useState(false)
-  const [deleteModal, setDeleteModal] = useState({ show: false, taskId: null })
-  const [logsModal, setLogsModal] = useState({ show: false, taskId: null, title: "", logs: "Loading logs..." })
-  const [settings, setSettings] = useState({ download_dir: '', dark_mode: true, use_playwright: true, ui_scale: 1.0 })
+  const [deleteTaskId, setDeleteTaskId] = useState(null)
+  const [logsModal, setLogsModal] = useState(null)
+  const [settings, setSettings] = useState({ ui_scale: 1 })
   const [draftSettings, setDraftSettings] = useState(null)
+  const downloadsRef = useRef(downloads)
+  const payloadRef = useRef('')
+  const scaleSaveTimer = useRef(null)
 
-  const fetchSettings = async () => {
-    try {
-      const res = await fetch('http://127.0.0.1:8000/api/settings');
-      if (res.ok) {
-        const data = await res.json();
-        setSettings(data);
-        setDraftSettings(data);
-      }
-    } catch (err) {
-      console.error("Failed to fetch settings", err);
-    }
-  }
+  useEffect(() => { downloadsRef.current = downloads }, [downloads])
 
-  const saveSettings = async (newSettings) => {
-    try {
-      await fetch('http://127.0.0.1:8000/api/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newSettings)
-      });
-      setSettings(newSettings);
-    } catch (err) {
-      console.error("Failed to save settings", err);
-    }
-  }
-
-  const fetchPlugins = async () => {
-    try {
-      const res = await fetch('http://127.0.0.1:8000/api/plugins');
-      if (res.ok) {
-        const data = await res.json();
-        setPluginsList(data.plugins || []);
-      }
-    } catch (err) {
-      console.error("Failed to fetch plugins", err);
-    }
-  }
+  const loadSettings = useCallback(async () => {
+    const response = await apiFetch('/settings')
+    const data = await response.json()
+    setSettings(data)
+    setDraftSettings(data)
+  }, [])
 
   useEffect(() => {
-    // Poll the backend every second to update tasks
-    const interval = setInterval(async () => {
+    const timer = window.setTimeout(() => loadSettings().catch(console.error), 0)
+    return () => window.clearTimeout(timer)
+  }, [loadSettings])
+
+  useEffect(() => {
+    let stopped = false
+    let timer
+    let controller
+    const poll = async () => {
+      controller = new AbortController()
+      let delay = document.hidden ? 5000 : 3000
       try {
-        const res = await fetch('http://127.0.0.1:8000/api/downloads');
-        if (res.ok) {
-          const data = await res.json();
-          setDownloads(data);
-          setStatus('Connected');
-        } else {
-          setStatus('Error');
+        const response = await fetch(`${API_ROOT}/downloads?limit=250`, { signal: controller.signal })
+        if (!response.ok) throw new Error(`HTTP ${response.status}`)
+        const text = await response.text()
+        if (text !== payloadRef.current) {
+          payloadRef.current = text
+          const data = JSON.parse(text)
+          setDownloads(data)
+          delay = data.some((task) => ACTIVE_STATUSES.has(task.status)) ? 750 : 3000
+        } else if (downloadsRef.current.some((task) => ACTIVE_STATUSES.has(task.status))) {
+          delay = 750
         }
-      } catch (err) {
-        setStatus('Disconnected');
+        setConnection('Connected')
+      } catch (error) {
+        if (error.name !== 'AbortError') setConnection('Disconnected')
+        delay = 3000
+      } finally {
+        if (!stopped) timer = window.setTimeout(poll, delay)
       }
-    }, 1000);
-    return () => clearInterval(interval);
-  }, []);
+    }
+    poll()
+    return () => {
+      stopped = true
+      window.clearTimeout(timer)
+      controller?.abort()
+    }
+  }, [])
 
-  const submitDownload = async (targetUrl) => {
-    const isDuplicate = downloadsRef.current.some(dl => dl.url === targetUrl);
-    if (isDuplicate) {
-      if (!window.confirm("This URL is already in your tasks. Do you want to download it again?")) {
-        return;
-      }
-    }
-    
-    try {
-      await fetch('http://127.0.0.1:8000/api/downloads', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: targetUrl })
-      });
-      setUrl('');
-    } catch (err) {
-      console.error("Failed to add download", err);
-    }
-  }
+  const submitDownload = useCallback(async (targetUrl) => {
+    if (!targetUrl) return
+    const duplicate = downloadsRef.current.some((task) => task.url === targetUrl)
+    if (duplicate && !window.confirm('This URL is already in your tasks. Download it again?')) return
+    await apiFetch('/downloads', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: targetUrl }),
+    })
+    setUrl('')
+  }, [])
 
   useEffect(() => {
-    const handleGlobalPaste = async (e) => {
-      const clipboardData = e.clipboardData || window.clipboardData;
-      const pastedData = clipboardData.getData('Text');
-      
-      if (pastedData) {
-        const urlMatch = pastedData.trim();
-        if (urlMatch.startsWith('http://') || urlMatch.startsWith('https://')) {
-          
-          // Don't hijack if user is pasting into any input fields (like the URL field or settings)
-          if (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') {
-            return;
-          }
-          
-          e.preventDefault();
-          submitDownload(urlMatch);
-        }
+    const paste = (event) => {
+      if (['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName)) return
+      const value = event.clipboardData?.getData('Text')?.trim()
+      if (value?.startsWith('http://') || value?.startsWith('https://')) {
+        event.preventDefault()
+        submitDownload(value).catch((error) => window.alert(error.message))
       }
-    };
-
-    window.addEventListener('paste', handleGlobalPaste);
-    return () => window.removeEventListener('paste', handleGlobalPaste);
-  }, []);
+    }
+    window.addEventListener('paste', paste)
+    return () => window.removeEventListener('paste', paste)
+  }, [submitDownload])
 
   useEffect(() => {
-    const handleWheel = (e) => {
-      if (e.ctrlKey) {
-        e.preventDefault();
-        setSettings(prev => {
-          let newScale = prev.ui_scale || 1.0;
-          if (e.deltaY < 0) {
-            newScale = Math.min(newScale + 0.1, 1.5);
-          } else {
-            newScale = Math.max(newScale - 0.1, 0.5);
-          }
-          newScale = parseFloat(newScale.toFixed(1));
-          
-          if (newScale !== prev.ui_scale) {
-             const newSettings = { ...prev, ui_scale: newScale };
-             setDraftSettings(newSettings);
-             fetch('http://127.0.0.1:8000/api/settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(newSettings)
-             }).catch(err => console.error("Failed to save scale", err));
-             return newSettings;
-          }
-          return prev;
-        });
-      }
-    };
-
-    window.addEventListener('wheel', handleWheel, { passive: false });
-    return () => window.removeEventListener('wheel', handleWheel);
-  }, []);
-
-  const handleDownload = async (e) => {
-    e.preventDefault();
-    if (!url) return;
-    submitDownload(url);
-  }
-
-  const handlePause = async (id) => {
-    try {
-      await fetch(`http://127.0.0.1:8000/api/downloads/${id}/pause`, { method: 'POST' });
-    } catch (err) { console.error(err); }
-  }
-
-  const handleResume = async (id) => {
-    try {
-      await fetch(`http://127.0.0.1:8000/api/downloads/${id}/resume`, { method: 'POST' });
-    } catch (err) { console.error(err); }
-  }
-
-  const handleRestart = async (id) => {
-    try {
-      await fetch(`http://127.0.0.1:8000/api/downloads/${id}/restart`, { method: 'POST' });
-    } catch (err) { console.error(err); }
-  }
-
-  const handlePauseAll = async () => {
-    try {
-      await fetch('http://127.0.0.1:8000/api/downloads/pause-all', { method: 'POST' });
-    } catch (err) { console.error(err); }
-  }
-
-  const handleResumeAll = async () => {
-    try {
-      await fetch('http://127.0.0.1:8000/api/downloads/resume-all', { method: 'POST' });
-    } catch (err) { console.error(err); }
-  }
-
-  const handleClearAll = async () => {
-    if (window.confirm("Are you sure you want to clear all tasks from the list? (Downloaded files will not be deleted)")) {
-      try {
-        await fetch('http://127.0.0.1:8000/api/downloads/clear-all', { method: 'POST' });
-      } catch (err) { console.error(err); }
+    const wheel = (event) => {
+      if (!event.ctrlKey) return
+      event.preventDefault()
+      setSettings((current) => {
+        const delta = event.deltaY < 0 ? 0.1 : -0.1
+        const next = { ...current, ui_scale: Math.max(0.5, Math.min(1.5, Number(((current.ui_scale || 1) + delta).toFixed(1)))) }
+        setDraftSettings(next)
+        window.clearTimeout(scaleSaveTimer.current)
+        scaleSaveTimer.current = window.setTimeout(() => {
+          apiFetch('/settings', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(next),
+          }).catch(console.error)
+        }, 350)
+        return next
+      })
     }
-  }
-
-  const handleDelete = async (id, deleteFiles) => {
-    try {
-      await fetch(`http://127.0.0.1:8000/api/downloads/${id}?delete_files=${deleteFiles}`, { method: 'DELETE' });
-    } catch (err) { console.error(err); }
-  }
-
-  const handleOpenFolder = async (id) => {
-    try {
-      await fetch(`http://127.0.0.1:8000/api/downloads/${id}/open`, { method: 'POST' });
-    } catch (err) { console.error(err); }
-  }
-
-  const handleDeleteChapter = async (taskId, chapter) => {
-    if (window.confirm(`Are you sure you want to cancel and delete "${chapter}"?`)) {
-      try {
-        await fetch(`http://127.0.0.1:8000/api/downloads/${taskId}/items/${encodeURIComponent(chapter)}`, { method: 'DELETE' });
-      } catch (err) {
-        console.error(err);
-      }
+    window.addEventListener('wheel', wheel, { passive: false })
+    return () => {
+      window.removeEventListener('wheel', wheel)
+      window.clearTimeout(scaleSaveTimer.current)
     }
-  }
+  }, [])
 
-  const handleViewLogs = async (id, title) => {
-    setLogsModal({ show: true, taskId: id, title: title, logs: "Loading logs..." });
+  const postAction = useCallback((path) => apiFetch(path, { method: 'POST' }).catch((error) => window.alert(error.message)), [])
+  const pause = useCallback((id) => postAction(`/downloads/${id}/pause`), [postAction])
+  const resume = useCallback((id) => postAction(`/downloads/${id}/resume`), [postAction])
+  const restart = useCallback((id) => postAction(`/downloads/${id}/restart`), [postAction])
+  const openFolder = useCallback((id) => postAction(`/downloads/${id}/open`), [postAction])
+
+  const deleteChapter = useCallback(async (id, chapter) => {
+    if (!window.confirm(`Cancel and delete "${chapter}"?`)) return
+    await apiFetch(`/downloads/${id}/items/${encodeURIComponent(chapter)}`, { method: 'DELETE' })
+  }, [])
+
+  const viewLogs = useCallback(async (id, title) => {
+    setLogsModal({ title, logs: 'Loading…' })
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/downloads/${id}/logs`);
-      const data = await res.json();
-      setLogsModal({ show: true, taskId: id, title: title, logs: data.logs });
-    } catch (err) {
-      setLogsModal({ show: true, taskId: id, title: title, logs: "Failed to fetch logs." });
+      const response = await apiFetch(`/downloads/${id}/logs`)
+      const data = await response.json()
+      setLogsModal({ title, logs: data.logs })
+    } catch (error) {
+      setLogsModal({ title, logs: error.message })
     }
-  }
+  }, [])
+
+  const deleteTask = useCallback((id) => setDeleteTaskId(id), [])
+  const visibleDownloads = downloads.slice(0, visibleCount)
 
   return (
-    <div className="container" style={{ padding: '0 2rem 2rem', maxWidth: '1200px', margin: '0 auto', zoom: settings.ui_scale || 1.0 }}>
-      <div style={{ position: 'sticky', top: 0, zIndex: 50, background: 'rgba(15, 23, 42, 0.95)', backdropFilter: 'blur(16px)', WebkitBackdropFilter: 'blur(16px)', padding: '2rem 0 1rem', margin: '0 0 1rem' }}>
-        <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '2rem' }} className="animate-fade-in">
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <div style={{ background: 'var(--accent-primary)', padding: '10px', borderRadius: '12px', display: 'flex' }}>
-            <Download size={24} color="white" />
+    <div className="container" style={{ padding: '0 2rem 2rem', maxWidth: '1200px', margin: '0 auto', zoom: settings.ui_scale || 1 }}>
+      <div className="sticky-header">
+        <header className="app-header">
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <div className="logo"><Download size={24} /></div>
+            <div><h1>Ultimate Universal Downloader</h1><p>Bounded concurrent media engine</p></div>
           </div>
-          <div>
-            <h1 style={{ fontSize: '1.5rem', fontWeight: 600 }}>Ultimate Universal Downloader (UUD)</h1>
-            <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>Extreme Concurrency & Anti-Bot Engine</p>
+          <div style={{ display: 'flex', gap: '10px' }}>
+            <button className="btn glass-panel" onClick={() => window.alert(`Backend: ${connection}`)}><Server size={17} /> {connection}</button>
+            <button className="btn glass-panel" onClick={async () => { const response = await apiFetch('/plugins'); setPlugins((await response.json()).plugins); setShowPlugins(true) }}><Layers size={17} /> Plugins</button>
+            <button className="btn glass-panel" onClick={() => { loadSettings().catch(console.error); setShowSettings(true) }}><Settings size={17} /></button>
           </div>
-        </div>
-        
-        <div style={{ display: 'flex', gap: '16px' }}>
-          <button className="btn glass-panel" style={{ background: 'rgba(255, 255, 255, 0.1)', color: 'white' }} onClick={() => alert(`Backend Status: ${status}`)}>
-            <Server size={18} /> Backend: {status}
-          </button>
-          <button className="btn glass-panel" style={{ background: 'rgba(255, 255, 255, 0.1)', color: 'white' }} onClick={() => { fetchPlugins(); setShowPlugins(true); }}>
-            <Layers size={18} /> Plugins
-          </button>
-          <button className="btn glass-panel" style={{ background: 'rgba(255, 255, 255, 0.1)', color: 'white' }} onClick={() => { fetchSettings(); setShowSettings(true); }}>
-            <Settings size={18} />
-          </button>
-        </div>
         </header>
-
-        <section className="glass-panel animate-fade-in" style={{ padding: '2rem', animationDelay: '0.1s' }}>
-          <form onSubmit={handleDownload} style={{ display: 'flex', gap: '16px', flexDirection: 'column' }}>
-            <label style={{ fontSize: '1.1rem', fontWeight: 500, display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <Link size={20} color="var(--accent-primary)" />
-              Paste URL to Download
-            </label>
+        <section className="glass-panel" style={{ padding: '1.5rem' }}>
+          <form onSubmit={(event) => { event.preventDefault(); submitDownload(url).catch((error) => window.alert(error.message)) }}>
+            <label><Link size={19} /> Paste URL to download</label>
             <div className="input-group">
-              <input 
-                type="text" 
-                className="input-field" 
-                placeholder="https://example.com/gallery/123..."
-                value={url}
-                onChange={(e) => setUrl(e.target.value)}
-              />
-              <button type="submit" className="btn btn-primary" style={{ padding: '0 32px' }}>
-                <Download size={18} /> Extract
-              </button>
-            </div>
-            <div style={{ display: 'flex', gap: '12px', marginTop: '8px' }}>
-              <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)', background: 'rgba(0,0,0,0.2)', padding: '4px 12px', borderRadius: '100px' }}>Supports: Images, Videos, HLS</span>
-              <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)', background: 'rgba(0,0,0,0.2)', padding: '4px 12px', borderRadius: '100px' }}>Bypass: Cloudflare, Turnstile</span>
+              <input className="input-field" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://example.com/gallery/123" />
+              <button className="btn btn-primary" type="submit"><Download size={17} /> Extract</button>
             </div>
           </form>
         </section>
       </div>
 
       <main>
-        <section>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-            <h2 style={{ fontSize: '1.2rem', margin: 0, display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <PlayCircle size={20} color="var(--text-muted)" /> Active Tasks
-            </h2>
-            <div style={{ display: 'flex', gap: '12px' }}>
-              <button className="btn btn-secondary glass-panel" style={{ background: 'rgba(255, 255, 255, 0.1)', padding: '6px 12px', fontSize: '0.9rem', color: 'white' }} onClick={handlePauseAll}>
-                <Pause size={14} /> Stop All
-              </button>
-              <button className="btn btn-secondary glass-panel" style={{ background: 'rgba(255, 255, 255, 0.1)', padding: '6px 12px', fontSize: '0.9rem', color: 'white' }} onClick={handleResumeAll}>
-                <Play size={14} /> Resume All
-              </button>
-              <button className="btn btn-secondary glass-panel" style={{ background: 'rgba(255, 255, 255, 0.1)', padding: '6px 12px', fontSize: '0.9rem', color: '#ef4444' }} onClick={handleClearAll}>
-                <Trash2 size={14} /> Clear All
-              </button>
-            </div>
+        <div className="task-heading">
+          <h2><PlayCircle size={20} /> Tasks</h2>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <button className="btn glass-panel" onClick={() => postAction('/downloads/pause-all')}><Pause size={14} /> Pause all</button>
+            <button className="btn glass-panel" onClick={() => postAction('/downloads/resume-all')}><Play size={14} /> Resume all</button>
+            <button className="btn glass-panel danger" onClick={async () => { if (window.confirm('Clear task history? Downloaded files are kept.')) await postAction('/downloads/clear-all') }}><Trash2 size={14} /> Clear all</button>
           </div>
-          
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-            {downloads.length === 0 ? (
-              <div className="glass-panel" style={{ padding: '3rem', textAlign: 'center', color: 'var(--text-muted)' }}>
-                <Search size={48} style={{ opacity: 0.2, margin: '0 auto 1rem' }} />
-                <p>No active downloads. Paste a link above to start.</p>
-              </div>
-            ) : (
-              downloads.map((dl, idx) => {
-                let totalItems = 0;
-                let doneItems = 0;
-                let totalSize = 0;
-                let meta = null;
-                if (dl.details && dl.details !== "{}") {
-                  Object.entries(JSON.parse(dl.details)).forEach(([key, s]) => {
-                    if (key === '_meta') {
-                      meta = s;
-                    } else if (key !== '_cancelled') {
-                      totalItems += s.total || 0;
-                      doneItems += s.done || 0;
-                      totalSize += s.size_bytes || 0;
-                    }
-                  });
-                }
-                
-                let borderColor = 'rgba(255,255,255,0.05)'; // default glass panel border
-                if (dl.status === 'completed') {
-                  borderColor = doneItems < totalItems ? 'rgba(234, 179, 8, 0.6)' : 'rgba(16, 185, 129, 0.6)'; // yellow : green
-                } else if (dl.status === 'extracting') {
-                  borderColor = 'rgba(59, 130, 246, 0.6)'; // blue
-                } else if (dl.status === 'error' || dl.status === 'failed') {
-                  borderColor = 'rgba(239, 68, 68, 0.6)'; // red
-                }
-
-                return (
-                <div key={dl.id} className="glass-panel" style={{ padding: '1.5rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '16px', border: `3px solid ${borderColor}`, transition: 'border-color 0.3s ease' }}>
-                  {dl.thumbnail && (
-                    <div style={{ flexShrink: 0, width: '120px', height: '160px', borderRadius: '8px', overflow: 'hidden', boxShadow: '0 4px 6px rgba(0,0,0,0.3)' }}>
-                      <img src={`http://127.0.0.1:8000/api/proxy?url=${encodeURIComponent(dl.thumbnail)}&referer=${encodeURIComponent(dl.url)}`} alt="Thumbnail" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-                    </div>
-                  )}
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <h3 style={{ fontWeight: 500, marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '8px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                      <span style={{ color: 'var(--text-muted)', fontSize: '0.9rem', marginRight: '4px', flexShrink: 0 }}>#{downloads.length - idx}</span>
-                      <img src={`https://www.google.com/s2/favicons?domain=${dl.url}&sz=32`} alt="icon" style={{ width: '18px', height: '18px', borderRadius: '4px', flexShrink: 0 }} onError={(e) => e.target.style.display = 'none'} />
-                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{dl.title}</span>
-                    </h3>
-                    <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginBottom: '12px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                      {dl.details && dl.details !== "{}" ? <span style={{ color: '#60a5fa' }}>{Object.keys(JSON.parse(dl.details)).filter(k => k !== '_cancelled' && k !== '_meta').length} items detected • </span> : ''}
-                      <a href={dl.url} target="_blank" rel="noopener noreferrer" style={{ color: 'inherit', textDecoration: 'none' }} onMouseEnter={e => e.target.style.textDecoration='underline'} onMouseLeave={e => e.target.style.textDecoration='none'}>
-                        {dl.url}
-                      </a>
-                    </p>
-                    
-                    {/* Main Progress Bar */}
-                    <div style={{ height: '6px', background: 'rgba(255,255,255,0.1)', borderRadius: '100px', overflow: 'hidden' }}>
-                      <div style={{ width: `${dl.progress}%`, height: '100%', background: 'var(--accent-primary)', transition: 'width 0.3s ease' }}></div>
-                    </div>
-                    
-                    {/* Itemized Progress */}
-                    {dl.details && dl.details !== "{}" && (
-                      <div style={{ marginTop: '16px', display: 'flex', flexDirection: 'column', gap: '10px', maxHeight: '150px', overflowY: 'auto', paddingRight: '8px' }}>
-                        {Object.entries(JSON.parse(dl.details))
-                          .filter(([chapter]) => chapter !== '_cancelled' && chapter !== '_meta')
-                          .map(([chapter, stats], idx) => (
-                          <div key={chapter} style={{ fontSize: '0.8rem' }}>
-                            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
-                              <span style={{ color: 'var(--text-muted)' }}>
-                                <span style={{ marginRight: '6px', opacity: 0.5 }}>#{idx + 1}</span>
-                                {chapter}
-                              </span>
-                              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                <span style={{ color: 'var(--text-muted)' }}>{stats.done} / {stats.total}</span>
-                                <button 
-                                  className="btn" 
-                                  style={{ padding: '0', color: '#ef4444', background: 'transparent', border: 'none', cursor: 'pointer' }}
-                                  onClick={() => handleDeleteChapter(dl.id, chapter)}
-                                  title="Cancel & Delete Item"
-                                >
-                                  <XCircle size={14} />
-                                </button>
-                              </div>
-                            </div>
-                            <div style={{ height: '4px', background: 'rgba(255,255,255,0.1)', borderRadius: '100px', overflow: 'hidden' }}>
-                              <div style={{ height: '100%', background: '#60a5fa', width: `${(stats.done / stats.total) * 100}%`, transition: 'width 0.3s ease' }} />
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                  <div style={{ paddingLeft: '2rem', textAlign: 'right', display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '8px' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '4px' }}>
-                      <span style={{ fontSize: '1.2rem', fontWeight: 600 }}>{dl.progress}%</span>
-                      <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>{dl.status}</p>
-                    </div>
-
-                    {(totalItems > 0 || totalSize > 0 || meta) ? (
-                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '4px', marginBottom: '8px' }}>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.85rem', color: (dl.status === 'completed' && doneItems < totalItems) ? '#ef4444' : 'var(--text-muted)' }}>
-                            <Image size={14} /> {doneItems} / {totalItems} items
-                          </div>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-                            <HardDrive size={14} /> {formatBytes(totalSize)}
-                          </div>
-                          {meta && meta.eta_seconds !== undefined && dl.status === 'downloading' && (
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.85rem', color: '#10b981' }}>
-                              <Clock size={14} /> ETA: {formatTime(meta.eta_seconds)}
-                            </div>
-                          )}
-                          {meta && meta.total_time_seconds !== undefined && ['completed', 'error'].includes(dl.status) && (
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.85rem', color: '#10b981' }}>
-                              <Clock size={14} /> Time: {formatTime(meta.total_time_seconds)}
-                            </div>
-                          )}
-                        </div>
-                      ) : null}
-                    
-                    <div style={{ display: 'flex', gap: '8px' }}>
-                      <button className="btn glass-panel" style={{ padding: '6px', color: '#10b981' }} onClick={() => handleViewLogs(dl.id, dl.title)} title="View Logs">
-                        <Info size={16} />
-                      </button>
-                      
-                      <button className="btn glass-panel" style={{ padding: '6px', color: '#60a5fa' }} onClick={() => handleOpenFolder(dl.id)} title="Open Folder">
-                        <FolderOpen size={16} />
-                      </button>
-                      
-                      {dl.status === 'downloading' && (
-                        <button className="btn glass-panel" style={{ padding: '6px' }} onClick={() => handlePause(dl.id)}>
-                          <Pause size={16} />
-                        </button>
-                      )}
-                      {dl.status === 'paused' && (
-                        <button className="btn glass-panel" style={{ padding: '6px', color: 'var(--accent-primary)' }} onClick={() => handleResume(dl.id)} title="Resume">
-                          <Play size={16} />
-                        </button>
-                      )}
-                      
-                      {['completed', 'error', 'failed'].includes(dl.status) && (
-                        <button className="btn glass-panel" style={{ padding: '6px', color: 'var(--accent-primary)' }} onClick={() => handleRestart(dl.id)} title="Restart Task (Skips existing files)">
-                          <RotateCw size={16} />
-                        </button>
-                      )}
-                      
-                      <button className="btn glass-panel" style={{ padding: '6px', color: '#ef4444' }} onClick={() => {
-                        setDeleteModal({ show: true, taskId: dl.id });
-                      }}>
-                        <Trash2 size={16} />
-                      </button>
-                    </div>
-                  </div>
-
-                </div>
-              )})
-            )}
-          </div>
-        </section>
+        </div>
+        <div style={{ display: 'grid', gap: '12px' }}>
+          {visibleDownloads.length === 0 ? (
+            <div className="glass-panel empty-state"><Search size={42} /><p>No tasks yet.</p></div>
+          ) : visibleDownloads.map((task, index) => (
+            <TaskCard
+              key={task.id}
+              task={task}
+              number={downloads.length - index}
+              onPause={pause}
+              onResume={resume}
+              onRestart={restart}
+              onDelete={deleteTask}
+              onOpen={openFolder}
+              onLogs={viewLogs}
+              onDeleteChapter={deleteChapter}
+            />
+          ))}
+          {visibleCount < downloads.length && <button className="btn glass-panel" onClick={() => setVisibleCount((count) => count + 50)}>Show 50 more</button>}
+        </div>
       </main>
 
-      {/* Plugins Modal */}
-      {showPlugins && (
-        <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100 }}>
-          <div className="glass-panel" style={{ width: '500px', padding: '2rem', background: '#0f172a' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
-              <h2 style={{ fontSize: '1.2rem', display: 'flex', alignItems: 'center', gap: '8px' }}><Layers size={20} /> Loaded Plugins</h2>
-              <button className="btn" style={{ padding: '8px' }} onClick={() => setShowPlugins(false)}><X size={20} /></button>
-            </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', maxHeight: '400px', overflowY: 'auto' }}>
-              {pluginsList.map((p, idx) => (
-                <div key={idx} style={{ background: 'rgba(255,255,255,0.05)', padding: '12px', borderRadius: '8px', display: 'flex', alignItems: 'center', gap: '12px' }}>
-                  {p.urls && p.urls.length > 0 && (
-                    <img src={`https://www.google.com/s2/favicons?domain=${p.urls[0]}&sz=32`} alt="favicon" style={{ width: '32px', height: '32px', borderRadius: '4px' }} />
-                  )}
-                  <div>
-                    <h3 style={{ fontWeight: 600, color: 'var(--accent-primary)' }}>{p.name}</h3>
-                    <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Supports: {p.urls.join(', ')}</p>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
+      {showPlugins && <Modal onClose={() => setShowPlugins(false)}><h2>Loaded plugins</h2>{plugins.map((plugin) => <div key={plugin.name} className="modal-row"><strong>{plugin.name}</strong><small>{plugin.urls.join(', ')}</small></div>)}</Modal>}
+
+      {showSettings && draftSettings && (
+        <Modal onClose={() => setShowSettings(false)} width="460px">
+          <h2>Settings</h2>
+          <label>Download directory<input className="input-field" value={draftSettings.download_dir || ''} onChange={(event) => setDraftSettings({ ...draftSettings, download_dir: event.target.value })} /></label>
+          <label className="check"><input type="checkbox" checked={draftSettings.use_playwright ?? true} onChange={(event) => setDraftSettings({ ...draftSettings, use_playwright: event.target.checked })} /> Allow Playwright fallback</label>
+          {[
+            ['max_concurrent_tasks', 'Concurrent tasks', 1, 20],
+            ['max_concurrent_items', 'Workers per task', 1, 50],
+            ['max_global_items', 'Global download limit', 1, 200],
+            ['max_concurrent_per_host', 'Per-host download limit', 1, 50],
+            ['max_extract_concurrency', 'Extraction concurrency', 1, 50],
+            ['request_timeout_seconds', 'Request timeout (seconds)', 5, 300],
+          ].map(([key, label, min, max]) => (
+            <label key={key}>{label}<input className="input-field compact" type="number" min={min} max={max} value={draftSettings[key]} onChange={(event) => setDraftSettings({ ...draftSettings, [key]: Number(event.target.value) })} /></label>
+          ))}
+          <label>UI scale: {draftSettings.ui_scale || 1}×<input type="range" min="0.5" max="1.5" step="0.1" value={draftSettings.ui_scale || 1} onChange={(event) => setDraftSettings({ ...draftSettings, ui_scale: Number(event.target.value) })} /></label>
+          <small>Engine concurrency changes take effect after restarting the app.</small>
+          <div className="modal-actions"><button className="btn" onClick={() => setShowSettings(false)}>Cancel</button><button className="btn btn-primary" onClick={async () => { const response = await apiFetch('/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(draftSettings) }); const data = await response.json(); setSettings(data.settings); setShowSettings(false) }}>Save</button></div>
+        </Modal>
       )}
 
-      {/* Delete Modal */}
-      {deleteModal.show && (
-        <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100 }}>
-          <div className="glass-panel" style={{ width: '400px', padding: '2rem', background: '#0f172a' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
-              <h2 style={{ fontSize: '1.2rem', display: 'flex', alignItems: 'center', gap: '8px', color: '#ef4444' }}><Trash2 size={20} /> Delete Task</h2>
-              <button className="btn" style={{ padding: '8px' }} onClick={() => setDeleteModal({ show: false, taskId: null })}><X size={20} /></button>
-            </div>
-            <div style={{ color: 'var(--text-muted)', marginBottom: '2rem' }}>
-              <p>How would you like to delete this task?</p>
-            </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-              <button className="btn glass-panel" style={{ width: '100%', justifyContent: 'center', color: '#ef4444' }} onClick={() => {
-                handleDelete(deleteModal.taskId, false);
-                setDeleteModal({ show: false, taskId: null });
-              }}>
-                Delete Task Only (Keep Files)
-              </button>
-              <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center', background: '#ef4444', color: 'white' }} onClick={() => {
-                handleDelete(deleteModal.taskId, true);
-                setDeleteModal({ show: false, taskId: null });
-              }}>
-                Delete Task AND All Files
-              </button>
-              <button className="btn" style={{ width: '100%', justifyContent: 'center' }} onClick={() => setDeleteModal({ show: false, taskId: null })}>
-                Cancel
-              </button>
-            </div>
+      {deleteTaskId && (
+        <Modal onClose={() => setDeleteTaskId(null)} width="420px">
+          <h2>Delete task</h2>
+          <p style={{ color: 'var(--text-muted)' }}>Choose whether downloaded files should also be removed.</p>
+          <div className="modal-actions vertical">
+            <button className="btn" onClick={async () => { await apiFetch(`/downloads/${deleteTaskId}?delete_files=false`, { method: 'DELETE' }); setDeleteTaskId(null) }}>Keep downloaded files</button>
+            <button className="btn danger" onClick={async () => { try { await apiFetch(`/downloads/${deleteTaskId}?delete_files=true`, { method: 'DELETE' }); setDeleteTaskId(null) } catch (error) { window.alert(error.message) } }}>Delete task and files</button>
           </div>
-        </div>
+        </Modal>
       )}
 
-      {/* Settings Modal */}
-      {showSettings && (
-        <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100 }}>
-          <div className="glass-panel" style={{ width: '400px', padding: '2rem', background: '#0f172a' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
-              <h2 style={{ fontSize: '1.2rem', display: 'flex', alignItems: 'center', gap: '8px' }}><Settings size={20} /> Settings</h2>
-              <button className="btn" style={{ padding: '8px' }} onClick={() => setShowSettings(false)}><X size={20} /></button>
-            </div>
-            <div style={{ color: 'var(--text-muted)' }}>
-              <p>Ultimate Universal Downloader (UUD) Version 1.0.0</p>
-              <br />
-              <div style={{ marginBottom: '1rem' }}>
-                <label style={{ display: 'block', marginBottom: '8px', color: 'white' }}>Download Directory:</label>
-                <input 
-                  type="text" 
-                  className="input-field" 
-                  style={{ width: '100%', padding: '8px', borderRadius: '4px' }}
-                  value={draftSettings?.download_dir || ''}
-                  onChange={(e) => setDraftSettings({...draftSettings, download_dir: e.target.value})}
-                />
-              </div>
-              <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
-                <input type="checkbox" checked={draftSettings?.dark_mode ?? true} onChange={(e) => setDraftSettings({...draftSettings, dark_mode: e.target.checked})} /> Dark Mode
-              </label>
-              <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '16px' }}>
-                <input type="checkbox" checked={draftSettings?.use_playwright ?? true} onChange={(e) => setDraftSettings({...draftSettings, use_playwright: e.target.checked})} /> Use Cloudflare Bypass (Playwright)
-              </label>
-              
-              <div style={{ marginBottom: '12px' }}>
-                <label style={{ display: 'block', marginBottom: '4px', color: 'white', fontSize: '0.9rem' }}>Max Concurrent Tasks:</label>
-                <input 
-                  type="number" 
-                  min="1" max="20"
-                  className="input-field" 
-                  style={{ width: '100px', padding: '6px', borderRadius: '4px' }}
-                  value={draftSettings?.max_concurrent_tasks || 3}
-                  onChange={(e) => setDraftSettings({...draftSettings, max_concurrent_tasks: parseInt(e.target.value) || 1})}
-                />
-              </div>
-
-              <div style={{ marginBottom: '8px' }}>
-                <label style={{ display: 'block', marginBottom: '4px', color: 'white', fontSize: '0.9rem' }}>Max Concurrent Items (per task):</label>
-                <input 
-                  type="number" 
-                  min="1" max="50"
-                  className="input-field" 
-                  style={{ width: '100px', padding: '6px', borderRadius: '4px' }}
-                  value={draftSettings?.max_concurrent_items || 5}
-                  onChange={(e) => setDraftSettings({...draftSettings, max_concurrent_items: parseInt(e.target.value) || 1})}
-                />
-              </div>
-
-              <div style={{ marginBottom: '8px' }}>
-                <label style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px', color: 'white', fontSize: '0.9rem' }}>
-                  <span>UI Scale: {draftSettings?.ui_scale || 1.0}x</span>
-                  <span style={{color: 'var(--text-muted)'}}>(Requires refresh)</span>
-                </label>
-                <input 
-                  type="range" 
-                  min="0.5" max="1.5" step="0.1"
-                  style={{ width: '100%', cursor: 'pointer' }}
-                  value={draftSettings?.ui_scale || 1.0}
-                  onChange={(e) => setDraftSettings({...draftSettings, ui_scale: parseFloat(e.target.value) || 1.0})}
-                />
-              </div>
-
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '12px', marginTop: '16px' }}>
-                <button className="btn" onClick={() => setShowSettings(false)}>Cancel</button>
-                <button className="btn btn-primary" onClick={() => {
-                  saveSettings(draftSettings);
-                  setShowSettings(false);
-                }}>Save Settings</button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Logs Modal */}
-      {logsModal.show && (
-        <div style={{ position: 'fixed', inset: 0, zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(4px)' }} onMouseDown={(e) => { if(e.target === e.currentTarget) setLogsModal({ show: false, taskId: null, title: "", logs: "" }) }}>
-          <div className="glass-panel" style={{ width: '90%', maxWidth: '800px', height: '80vh', padding: '24px', display: 'flex', flexDirection: 'column', animation: 'scale-in 0.2s ease-out' }} onClick={e => e.stopPropagation()} onMouseDown={e => e.stopPropagation()}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
-              <h3 style={{ fontSize: '1.2rem', margin: 0 }}>Task Logs: {logsModal.title}</h3>
-              <button className="btn" style={{ background: 'transparent', padding: '4px' }} onClick={() => setLogsModal({ show: false, taskId: null, title: "", logs: "" })}>
-                <X size={20} />
-              </button>
-            </div>
-            
-            <div style={{ flex: 1, background: '#0f172a', borderRadius: '8px', padding: '16px', overflowY: 'auto', fontFamily: 'monospace', fontSize: '0.85rem', color: '#a7f3d0', whiteSpace: 'pre-wrap', border: '1px solid rgba(255,255,255,0.1)', boxShadow: 'inset 0 2px 10px rgba(0,0,0,0.5)', userSelect: 'text', WebkitUserSelect: 'text', cursor: 'text' }}>
-              {logsModal.logs}
-            </div>
-            
-            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '16px' }}>
-              <button className="btn" onClick={() => setLogsModal({ show: false, taskId: null, title: "", logs: "" })}>Close</button>
-            </div>
-          </div>
-        </div>
-      )}
+      {logsModal && <Modal onClose={() => setLogsModal(null)} width="800px"><h2>{logsModal.title}</h2><pre className="log-viewer">{logsModal.logs}</pre></Modal>}
     </div>
   )
 }

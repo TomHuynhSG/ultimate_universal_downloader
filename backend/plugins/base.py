@@ -1,15 +1,22 @@
+import inspect
+
+
 class BaseExtractor:
-    # Subclasses should define this list of supported domain strings
     URLS = []
-    
-    def __init__(self, url):
+
+    def __init__(self, url, progress_callback=None):
         self.url = url
         self.urls = []
         self.title = "Unknown Album"
-    
+        self.thumbnail = None
+        self.progress_callback = progress_callback
+
+    async def report_progress(self, **payload):
+        if not self.progress_callback:
+            return
+        result = self.progress_callback(payload)
+        if inspect.isawaitable(result):
+            await result
+
     async def extract(self, session):
-        """
-        Extract direct links and populate self.urls.
-        Uses the provided async curl_cffi session to bypass protections.
-        """
         raise NotImplementedError()

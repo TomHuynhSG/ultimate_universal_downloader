@@ -2,6 +2,7 @@ import re
 import asyncio
 from bs4 import BeautifulSoup
 from backend.plugins.base import BaseExtractor
+from backend.plugins.utils import bounded_map
 
 class EHentaiExtractor(BaseExtractor):
     URLS = ['e-hentai.org']
@@ -94,8 +95,7 @@ class EHentaiExtractor(BaseExtractor):
                     print(f"Failed to extract e-hentai image page: {e}")
                 return None
                 
-        tasks = [fetch_real_img(item) for item in image_page_items]
-        results = await asyncio.gather(*tasks)
+        results = await bounded_map(image_page_items, fetch_real_img, limit=3)
         
         for res in results:
             if res:

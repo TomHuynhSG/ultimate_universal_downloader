@@ -1,150 +1,243 @@
+import asyncio
+import json
 import re
+import struct
+import time
 import urllib.parse
-from backend.plugins.base import BaseExtractor
+
+from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
-class HitomiExtractor(BaseExtractor):
-    URLS = ['hitomi.la']
+from backend.core.config import get_settings
+from backend.core.paths import sanitize_component
+from backend.plugins.base import BaseExtractor
+from backend.plugins.utils import bounded_map
 
-    async def extract_single(self, page, url, is_sub=False):
-        match = re.search(r'-(\d+)\.html|/galleries/(\d+)\.html|/reader/(\d+)\.html', url)
-        if not match: return []
-        gallery_id = next(g for g in match.groups() if g)
-        
-        await page.goto(url, wait_until="domcontentloaded")
-        title = await page.title()
-        raw_title = title.replace('| Hitomi.la', '').strip()
-        
-        # Replace normal pipe with fullwidth pipe for Windows folder compatibility
-        raw_title = raw_title.replace('|', '｜')
-        
+
+class HitomiExtractor(BaseExtractor):
+    URLS = ["hitomi.la"]
+    ASSET_ORIGIN = "https://ltn.gold-usergeneratedcontent.net"
+    IMAGE_DOMAIN = "gold-usergeneratedcontent.net"
+    _resolver = None
+    _resolver_loaded_at = 0.0
+    _resolver_lock = None
+
+    @staticmethod
+    def _gallery_id(url):
+        match = re.search(r"-(\d+)\.html|/galleries/(\d+)\.html|/reader/(\d+)\.html", url)
+        return next((group for group in match.groups() if group), None) if match else None
+
+    @classmethod
+    async def _load_resolver(cls, session, *, force=False):
+        if cls._resolver_lock is None:
+            cls._resolver_lock = asyncio.Lock()
+        if cls._resolver and not force and time.monotonic() - cls._resolver_loaded_at < 600:
+            return cls._resolver
+
+        async with cls._resolver_lock:
+            if cls._resolver and not force and time.monotonic() - cls._resolver_loaded_at < 600:
+                return cls._resolver
+            timeout = get_settings()["request_timeout_seconds"]
+            response = await session.get(f"{cls.ASSET_ORIGIN}/gg.js", timeout=timeout)
+            if response.status_code != 200:
+                raise RuntimeError(f"Hitomi resolver returned HTTP {response.status_code}")
+
+            mapping = {}
+            block_pattern = r"((?:\s*case\s+\d+\s*:\s*)+)o\s*=\s*(\d+)\s*;\s*break\s*;"
+            for cases, value in re.findall(block_pattern, response.text):
+                for number in re.findall(r"case\s+(\d+)", cases):
+                    mapping[int(number)] = int(value)
+            base_match = re.search(r"b:\s*'([^']+)'", response.text)
+            if not base_match or not mapping:
+                raise RuntimeError("Hitomi resolver format was not recognized")
+
+            cls._resolver = (mapping, base_match.group(1))
+            cls._resolver_loaded_at = time.monotonic()
+            return cls._resolver
+
+    @classmethod
+    def _url_from_hash(cls, image_hash, resolver):
+        mapping, base_path = resolver
+        if not re.fullmatch(r"[0-9a-f]{64}", image_hash or ""):
+            raise ValueError("Invalid Hitomi image hash")
+        rotated = int(image_hash[-1] + image_hash[-3:-1], 16)
+        shard = 1 + mapping.get(rotated, 1)
+        return (
+            f"https://w{shard}.{cls.IMAGE_DOMAIN}/"
+            f"{base_path}{rotated}/{image_hash}.webp"
+        )
+
+    async def _get(self, session, url, *, attempts=3):
+        timeout = get_settings()["request_timeout_seconds"]
+        last_error = None
+        for attempt in range(attempts):
+            try:
+                response = await session.get(url, timeout=timeout)
+                if response.status_code == 200:
+                    return response
+                last_error = RuntimeError(f"HTTP {response.status_code} for {url}")
+            except Exception as exc:
+                last_error = exc
+            if attempt + 1 < attempts:
+                await asyncio.sleep(0.5 * (2**attempt))
+        raise last_error or RuntimeError(f"Failed to fetch {url}")
+
+    async def _fetch_gallery(self, session, gallery_id, resolver, foldered):
+        response = await self._get(
+            session, f"{self.ASSET_ORIGIN}/galleries/{gallery_id}.js"
+        )
+        match = re.search(r"var\s+galleryinfo\s*=\s*(\{.*\})\s*;?\s*$", response.text, re.S)
+        if not match:
+            raise RuntimeError(f"Gallery {gallery_id} metadata was malformed")
+        data = json.loads(match.group(1))
+        if data.get("blocked"):
+            raise RuntimeError(f"Gallery {gallery_id} is blocked")
+
+        raw_title = data.get("title") or data.get("japanese_title") or f"Hitomi Gallery {gallery_id}"
+        artists = [entry.get("artist") for entry in data.get("artists", []) if entry.get("artist")]
+        artist_suffix = f" by {', '.join(name.title() for name in artists)}" if artists else ""
+        gallery_title = sanitize_component(
+            f"{raw_title}{artist_suffix} ({gallery_id})",
+            fallback=f"Hitomi Gallery {gallery_id}",
+        )
+
+        items = []
+        for file_data in data.get("files", []):
+            image_hash = file_data.get("hash")
+            name = file_data.get("name") or f"{len(items) + 1:03d}.webp"
+            filename = re.sub(r"\.[^/.]+$", ".webp", name)
+            item = {
+                "url": self._url_from_hash(image_hash, resolver),
+                "filename": filename,
+                "referer": "https://hitomi.la/",
+            }
+            if foldered:
+                item["folder"] = gallery_title
+            items.append(item)
+        if not items:
+            raise RuntimeError(f"Gallery {gallery_id} contained no downloadable files")
+        return gallery_title, items
+
+    async def _collection_ids(self, session):
+        parsed = urllib.parse.urlparse(self.url)
+        path = parsed.path.lstrip("/")
+        if not path.endswith(".html"):
+            raise RuntimeError("Unsupported Hitomi collection URL")
+        nozomi_path = f"{path[:-5]}.nozomi"
+        response = await self._get(session, f"{self.ASSET_ORIGIN}/{nozomi_path}")
+        if not response.content or len(response.content) % 4:
+            raise RuntimeError("Hitomi collection index was malformed")
+        gallery_ids = [str(item[0]) for item in struct.iter_unpack(">I", response.content)]
+        return list(dict.fromkeys(gallery_ids))
+
+    async def _collection_title(self, session):
         try:
-            artists = await page.eval_on_selector_all('h2 ul.comma-list li a', 'elements => elements.map(e => e.innerText)')
+            response = await self._get(session, self.url, attempts=2)
+            soup = BeautifulSoup(response.text, "html.parser")
+            raw = soup.title.get_text(" ", strip=True) if soup.title else "Hitomi Collection"
+            raw = raw.replace("| Hitomi.la", "").strip()
+            raw = re.sub(r"(?i)\s*\([^)]*\)$", "", raw).strip()
+            return sanitize_component(raw.title(), fallback="Hitomi Collection")
         except Exception:
-            artists = []
-            
-        if artists:
-            import re as regex
-            # Hitomi appends " by artist_name" at the end of the title. Strip it case-insensitively.
-            parts = regex.split(r'(?i)\s+by\s+', raw_title)
-            if len(parts) > 1:
-                # Rejoin all but the last part (which is the artist name)
-                raw_title = " by ".join(parts[:-1])
-                
-            artist_str = ", ".join([a.title() for a in artists])
-            gallery_title = f"{raw_title} by {artist_str} ({gallery_id})"
-        else:
-            gallery_title = f"{raw_title} ({gallery_id})"
-            
-        if not is_sub:
-            self.title = gallery_title
-            
-        try:
-            cover_el = await page.wait_for_selector(".cover img, .gallery-preview img", timeout=5000)
-            if cover_el and not is_sub:
-                self.thumbnail = await cover_el.get_attribute("src")
-                if self.thumbnail and self.thumbnail.startswith("//"):
-                    self.thumbnail = "https:" + self.thumbnail
-        except Exception:
-            pass
-            
-        reader_url = f"https://hitomi.la/reader/{gallery_id}.html#1"
-        await page.goto(reader_url, wait_until="domcontentloaded")
-        
-        # Wait until galleryinfo is loaded into the window
-        try:
-            await page.wait_for_function("typeof galleryinfo !== 'undefined'", timeout=15000)
-        except Exception:
-            pass
-        
-        js_eval = f"""
-        () => {{
-            const items = [];
-            for (let i = 0; i < galleryinfo.files.length; i++) {{
-                const url = url_from_url_from_hash("{gallery_id}", galleryinfo.files[i], "webp");
-                let originalName = galleryinfo.files[i].name;
-                originalName = originalName.replace(/\\.[^/.]+$/, ".webp");
-                items.push({{
-                    "url": url,
-                    "filename": originalName,
-                    "referer": "https://hitomi.la/"
-                }});
-            }}
-            return items;
-        }}
-        """
-        try:
-            image_urls = await page.evaluate(js_eval)
-            if is_sub:
-                import re as regex
-                folder = regex.sub(r'[\\/*?:"<>|]', "", gallery_title).strip()
-                for img in image_urls:
-                    img['folder'] = folder
-            return image_urls
-        except Exception as e:
-            print(f"Failed to evaluate hitomi JS: {e}")
-            return []
+            slug = urllib.parse.unquote(urllib.parse.urlparse(self.url).path.rsplit("/", 1)[-1])
+            slug = re.sub(r"-(?:all|english|japanese)\.html$", "", slug, flags=re.I)
+            return sanitize_component(slug.replace("-", " ").title(), fallback="Hitomi Collection")
+
+    async def _extract_direct(self, session):
+        resolver = await self._load_resolver(session)
+        single_id = self._gallery_id(self.url)
+        if single_id:
+            title, items = await self._fetch_gallery(session, single_id, resolver, False)
+            self.title = title
+            self.thumbnail = items[0]["url"]
+            await self.report_progress(phase="extracting", completed=1, total=1, errors=0)
+            return items
+
+        gallery_ids = await self._collection_ids(session)
+        if not gallery_ids:
+            raise RuntimeError("Hitomi collection contained no galleries")
+        self.title = await self._collection_title(session)
+
+        concurrency = get_settings()["max_extract_concurrency"]
+
+        async def fetch(index_and_id):
+            index, gallery_id = index_and_id
+            title, items = await self._fetch_gallery(session, gallery_id, resolver, True)
+            return index, title, items
+
+        async def progress(completed, total, errors):
+            await self.report_progress(
+                phase="extracting", completed=completed, total=total, errors=errors
+            )
+
+        raw_results = await bounded_map(
+            list(enumerate(gallery_ids)),
+            fetch,
+            limit=concurrency,
+            return_exceptions=True,
+            on_progress=progress,
+        )
+        errors = [str(result) for result in raw_results if isinstance(result, Exception)]
+        results = [result for result in raw_results if isinstance(result, tuple)]
+        results.sort(key=lambda result: result[0])
+        self.extraction_errors = errors
+        items = [item for _index, _title, gallery_items in results for item in gallery_items]
+        if not items:
+            raise RuntimeError("Every gallery in the Hitomi collection failed extraction")
+        self.thumbnail = items[0]["url"] if items else None
+        return items
+
+    async def _extract_with_playwright(self):
+        """Compatibility fallback used only if Hitomi changes its direct endpoints."""
+        gallery_id = self._gallery_id(self.url)
+        if not gallery_id:
+            raise RuntimeError("Playwright fallback supports individual galleries only")
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in {"image", "stylesheet", "font", "media"}
+                else route.continue_(),
+            )
+            try:
+                await page.goto(
+                    f"https://hitomi.la/reader/{gallery_id}.html#1",
+                    wait_until="domcontentloaded",
+                    timeout=30_000,
+                )
+                await page.wait_for_function("typeof galleryinfo !== 'undefined'", timeout=15_000)
+                payload = await page.evaluate(
+                    r"""
+                    galleryId => ({
+                      title: galleryinfo.title || galleryinfo.japanese_title,
+                      artists: (galleryinfo.artists || []).map(value => value.artist),
+                      items: galleryinfo.files.map(file => ({
+                        url: url_from_url_from_hash(galleryId, file, 'webp'),
+                        filename: file.name.replace(/\.[^/.]+$/, '.webp'),
+                        referer: 'https://hitomi.la/'
+                      }))
+                    })
+                    """,
+                    gallery_id,
+                )
+            finally:
+                await browser.close()
+        artists = payload.get("artists") or []
+        suffix = f" by {', '.join(name.title() for name in artists)}" if artists else ""
+        self.title = sanitize_component(
+            f"{payload.get('title') or 'Hitomi Gallery'}{suffix} ({gallery_id})",
+            fallback=f"Hitomi Gallery {gallery_id}",
+        )
+        self.thumbnail = payload["items"][0]["url"] if payload.get("items") else None
+        return payload.get("items") or []
 
     async def extract(self, session):
-        is_collection = not re.search(r'-(?:\d+)\.html|/galleries/(?:\d+)\.html|/reader/(?:\d+)\.html', self.url)
-        
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            
-            if is_collection:
-                self.title = "Hitomi Collection"
-                all_items = []
-                seen_galleries = set()
-                
-                parsed = urllib.parse.urlparse(self.url)
-                base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-                
-                await page.goto(self.url, wait_until="domcontentloaded")
-                title = await page.title()
-                raw_title = title.replace('| Hitomi.la', '').strip()
-                
-                # Strip out language suffixes like " (English)" and title-case the artist name
-                import re as regex
-                raw_title = regex.sub(r'(?i)\s*\([^)]*\)$', '', raw_title).strip()
-                self.title = raw_title.title()
-                
-                p_num = 1
-                while True:
-                    page_url = f"{base_url}?page={p_num}" if p_num > 1 else self.url
-                    if p_num > 1:
-                        await page.goto(page_url, wait_until="domcontentloaded")
-                        
-                    try:
-                        await page.wait_for_selector('.gallery-content a.lillie, .manga h1 a', state='attached', timeout=10000)
-                    except Exception:
-                        pass
-                        
-                    links = await page.eval_on_selector_all('.gallery-content a.lillie', 'elements => elements.map(e => e.href)')
-                    if not links:
-                        links = await page.eval_on_selector_all('.manga h1 a', 'elements => elements.map(e => e.href)')
-                        
-                    new_links = []
-                    for link in links:
-                        match = re.search(r'-(\d+)\.html|/galleries/(\d+)\.html', link)
-                        if match:
-                            gid = next(g for g in match.groups() if g)
-                            if gid not in seen_galleries:
-                                seen_galleries.add(gid)
-                                new_links.append(link)
-                                
-                    if not new_links:
-                        break
-                        
-                    for link in new_links:
-                        items = await self.extract_single(page, link, is_sub=True)
-                        all_items.extend(items)
-                        
-                    p_num += 1
-                    
-                await browser.close()
-                return all_items
-            else:
-                items = await self.extract_single(page, self.url)
-                await browser.close()
-                return items
+        self.extraction_errors = []
+        try:
+            return await self._extract_direct(session)
+        except Exception:
+            if not get_settings().get("use_playwright", True):
+                raise
+            return await self._extract_with_playwright()
