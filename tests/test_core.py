@@ -3,11 +3,15 @@ import tempfile
 import unittest
 from contextlib import asynccontextmanager
 from pathlib import Path
+from unittest.mock import patch
 
+from backend.api.router import OpenDownloadDirectoryRequest, open_download_directory
+from backend.core.config import DEFAULT_SETTINGS
 from backend.core.downloader import DownloadManager
 from backend.core.paths import resolve_within, sanitize_component
 from backend.plugins.manager import PluginManager
 from backend.plugins.utils import bounded_map
+from plugins.hitomi import HitomiExtractor
 
 
 class DummyLogger:
@@ -34,6 +38,9 @@ class FakeSession:
 
 
 class PathTests(unittest.TestCase):
+    def test_default_download_directory_is_absolute(self):
+        self.assertTrue(Path(DEFAULT_SETTINGS["download_dir"]).is_absolute())
+
     def test_sanitize_rejects_dot_components(self):
         self.assertEqual(sanitize_component("..", fallback="safe"), "safe")
 
@@ -43,11 +50,30 @@ class PathTests(unittest.TestCase):
                 resolve_within(directory, "..", "outside")
 
 
+class SettingsTests(unittest.TestCase):
+    @patch("backend.api.router._open_directory")
+    def test_open_download_directory_creates_and_opens_draft_path(self, open_directory):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "new-downloads"
+            request = OpenDownloadDirectoryRequest(directory=str(target))
+            result = open_download_directory(request)
+
+            self.assertTrue(target.is_dir())
+            open_directory.assert_called_once_with(target.resolve())
+            self.assertEqual(result["directory"], str(target.resolve()))
+
+
 class PluginManagerTests(unittest.TestCase):
     def test_domain_matching_is_hostname_aware(self):
         self.assertTrue(PluginManager._matches("https://hitomi.la/galleries/1.html", "hitomi.la"))
         self.assertFalse(PluginManager._matches("https://evil.example/?next=hitomi.la", "hitomi.la"))
         self.assertFalse(PluginManager._matches("file:///tmp/hitomi.la", "hitomi.la"))
+
+
+class HitomiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_artist_collection_uses_artist_as_parent_folder(self):
+        extractor = HitomiExtractor("https://hitomi.la/artist/liyoosa-english.html")
+        self.assertEqual(await extractor._collection_title(None), "Liyoosa")
 
 
 class AsyncPipelineTests(unittest.IsolatedAsyncioTestCase):

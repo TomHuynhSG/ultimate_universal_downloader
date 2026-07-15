@@ -69,18 +69,36 @@ npm run build
 
 ## Configuration
 
-Settings are stored in the project-level `settings.json` and can be edited through the UI.
+Settings are stored in the project-level `settings.json` and can be edited through the UI. New installations default to the signed-in user's real Desktop folder; on Windows this respects Desktop redirection and OneDrive when configured. The button beside the directory field creates the selected folder if necessary and opens that draft path in Explorer without requiring it to be saved first.
 
 | Setting | Default | Purpose |
 | --- | ---: | --- |
-| `max_concurrent_tasks` | 3 | Parent download pipelines running at once |
-| `max_concurrent_items` | 5 | Download workers allocated to each task |
-| `max_global_items` | 15 | Maximum downloads across all tasks |
-| `max_concurrent_per_host` | 6 | Maximum downloads sent to one hostname |
-| `max_extract_concurrency` | 8 | Upper bound for plugin metadata requests |
-| `request_timeout_seconds` | 30 | Timeout for individual HTTP operations |
+| `max_concurrent_tasks` | 3 | Parent task pipelines allowed to extract or download at once |
+| `max_concurrent_items` | 5 | Fixed media-download workers created inside each task |
+| `max_global_items` | 15 | Hard ceiling for simultaneous media downloads across all tasks |
+| `max_concurrent_per_host` | 6 | Simultaneous media downloads allowed for one exact hostname |
+| `max_extract_concurrency` | 8 | Metadata/page requests allowed inside each optimized extractor |
+| `request_timeout_seconds` | 30 | Maximum wait for one HTTP operation; this is not a request delay |
 
-Engine-level concurrency changes take effect after restarting the application. Increase limits gradually: higher values can trigger rate limits and often reduce throughput on slower hosts.
+### Choosing safe concurrency values
+
+These controls limit requests at different layers. Effective media concurrency is the smallest applicable limit: running tasks × workers per task, the global limit, or the per-host limit. For example, the values **2 tasks**, **2 workers**, **3 global**, and **2 per host** can produce at most three simultaneous downloads overall and at most two to the same hostname.
+
+Extraction is a separate phase. With extraction concurrency set to 2, each running optimized plugin may issue up to two metadata/page requests at once; two tasks extracting simultaneously may therefore issue four. Plugins may impose a lower site-specific cap. The per-host download limit is keyed by exact hostname, so a site using several CDN hostnames can exceed that number in aggregate; the global limit remains the final download safeguard.
+
+Use a conservative profile for sites that return `429`, `403`, CAPTCHA pages, connection resets, or incomplete collections:
+
+| Profile | Tasks | Workers/task | Global | Per host | Extraction | Timeout |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Modest (safe) | 1 | 2 | 2 | 1 | 1 | 45 s |
+| Balanced | 2 | 3 | 6 | 3 | 4 | 30 s |
+| Aggressive (risky) | 4 | 8 | 24 | 8 | 12 | 30 s |
+
+The Settings page provides these three presets as one-click starting points; selecting one fills the fields but does not apply it until you choose **Save**. Start with Modest and raise one level at a time while watching task logs and failure counts. More concurrency is not always faster: server throttling, retries, and connection setup can reduce total throughput. After a rate-limit response, lower the preset and allow the site time to recover instead of immediately restarting the task.
+
+These are **concurrency** controls, not requests-per-second controls. A value of 1 prevents overlap but can still send sequential requests back-to-back. If a website requires a fixed delay, its plugin should implement shared asynchronous pacing with `asyncio.sleep()` or a rate limiter. Increasing the timeout only lets a slow request remain open longer; it does not make requests gentler and an unnecessarily low timeout can cause extra retries.
+
+Engine-level concurrency changes take effect after restarting the application.
 
 ## Writing an Optimized Plugin
 
@@ -207,7 +225,7 @@ Browser navigation is much more expensive than direct HTTP requests. If it is un
 - close the browser in `finally`; and
 - keep browser work bounded by `max_extract_concurrency`.
 
-The Hitomi extractor in `plugins/hitomi.py` demonstrates the preferred design: cached direct metadata resolution on the normal path, bounded gallery workers, stable ordering, partial errors, and a browser fallback only if the direct endpoint changes.
+The Hitomi extractor in `plugins/hitomi.py` demonstrates the preferred design: cached direct metadata resolution on the normal path, bounded gallery workers, stable ordering, partial errors, and a browser fallback only if the direct endpoint changes. Artist, group, series, and character collection URLs use the collection slug as their parent folder (for example, `artist/liyoosa-english.html` downloads under `Liyoosa/`), while individual galleries remain nested below it.
 
 ### Validation checklist
 

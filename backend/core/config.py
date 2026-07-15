@@ -7,8 +7,38 @@ from backend.core.paths import PROJECT_ROOT
 
 
 SETTINGS_FILE = PROJECT_ROOT / "settings.json"
+
+
+def _desktop_directory():
+    """Return the signed-in user's redirected Desktop when Windows exposes it."""
+    candidates = []
+    if os.name == "nt":
+        try:
+            import winreg
+
+            key_path = r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+                desktop, _value_type = winreg.QueryValueEx(key, "Desktop")
+                if desktop:
+                    candidates.append(Path(os.path.expandvars(desktop)).expanduser())
+        except (OSError, ImportError, TypeError):
+            pass
+
+        if one_drive := os.environ.get("OneDrive"):
+            candidates.append(Path(one_drive) / "Desktop")
+
+    candidates.append(Path.home() / "Desktop")
+    for candidate in candidates:
+        try:
+            if candidate.is_dir():
+                return candidate.resolve(strict=False)
+        except OSError:
+            continue
+    return candidates[0].resolve(strict=False)
+
+
 DEFAULT_SETTINGS = {
-    "download_dir": str(PROJECT_ROOT / "downloads"),
+    "download_dir": str(_desktop_directory()),
     "dark_mode": True,
     "use_playwright": True,
     "max_concurrent_tasks": 3,
@@ -32,10 +62,11 @@ def _validated(settings):
     result["max_extract_concurrency"] = max(1, min(int(result["max_extract_concurrency"] or 1), 50))
     result["request_timeout_seconds"] = max(5, min(int(result["request_timeout_seconds"] or 30), 300))
     result["ui_scale"] = max(0.5, min(float(result["ui_scale"] or 1.0), 1.5))
+    download_dir = os.path.expandvars(
+        str(result["download_dir"] or DEFAULT_SETTINGS["download_dir"])
+    )
     result["download_dir"] = str(
-        Path(result["download_dir"] or DEFAULT_SETTINGS["download_dir"])
-        .expanduser()
-        .resolve(strict=False)
+        Path(download_dir).expanduser().resolve(strict=False)
     )
     return result
 

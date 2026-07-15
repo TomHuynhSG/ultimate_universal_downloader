@@ -130,18 +130,45 @@ class HitomiExtractor(BaseExtractor):
         gallery_ids = [str(item[0]) for item in struct.iter_unpack(">I", response.content)]
         return list(dict.fromkeys(gallery_ids))
 
+    @staticmethod
+    def _collection_slug_title(url):
+        slug = urllib.parse.unquote(urllib.parse.urlparse(url).path.rsplit("/", 1)[-1])
+        slug = re.sub(r"\.html$", "", slug, flags=re.I)
+        slug = re.sub(
+            r"-(?:all|english|japanese|chinese|korean|spanish|portuguese|"
+            r"russian|german|french|italian|polish|thai|vietnamese|"
+            r"indonesian|dutch|hungarian)$",
+            "",
+            slug,
+            flags=re.I,
+        )
+        return sanitize_component(
+            slug.replace("-", " ").replace("_", " ").title(),
+            fallback="Hitomi Collection",
+        )
+
     async def _collection_title(self, session):
+        parsed = urllib.parse.urlparse(self.url)
+        collection_type = parsed.path.strip("/").split("/", 1)[0].lower()
+        slug_title = self._collection_slug_title(self.url)
+
+        # Identity collection URLs already contain the most useful parent-folder name.
+        # Avoid another HTML navigation and keep galleries grouped by artist/group/etc.
+        if collection_type in {"artist", "group", "series", "character"}:
+            return slug_title
+
         try:
             response = await self._get(session, self.url, attempts=2)
             soup = BeautifulSoup(response.text, "html.parser")
-            raw = soup.title.get_text(" ", strip=True) if soup.title else "Hitomi Collection"
-            raw = raw.replace("| Hitomi.la", "").strip()
+            if not soup.title:
+                return slug_title
+            raw = soup.title.get_text(" ", strip=True).replace("| Hitomi.la", "").strip()
             raw = re.sub(r"(?i)\s*\([^)]*\)$", "", raw).strip()
-            return sanitize_component(raw.title(), fallback="Hitomi Collection")
+            if raw.casefold() in {"", "hitomi.la", "hitomi collection"}:
+                return slug_title
+            return sanitize_component(raw.title(), fallback=slug_title)
         except Exception:
-            slug = urllib.parse.unquote(urllib.parse.urlparse(self.url).path.rsplit("/", 1)[-1])
-            slug = re.sub(r"-(?:all|english|japanese)\.html$", "", slug, flags=re.I)
-            return sanitize_component(slug.replace("-", " ").title(), fallback="Hitomi Collection")
+            return slug_title
 
     async def _extract_direct(self, session):
         resolver = await self._load_resolver(session)

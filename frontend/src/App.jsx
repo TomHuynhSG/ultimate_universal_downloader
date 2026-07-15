@@ -24,6 +24,50 @@ import './index.css'
 const API_ROOT = '/api'
 const ACTIVE_STATUSES = new Set(['pending', 'extracting', 'downloading', 'paused'])
 const FINISHED_STATUSES = new Set(['completed', 'completed_with_errors', 'error', 'failed'])
+const CONCURRENCY_PRESETS = [
+  {
+    id: 'modest',
+    label: 'Modest',
+    risk: 'Safe',
+    description: 'Sensitive sites',
+    values: {
+      max_concurrent_tasks: 1,
+      max_concurrent_items: 2,
+      max_global_items: 2,
+      max_concurrent_per_host: 1,
+      max_extract_concurrency: 1,
+      request_timeout_seconds: 45,
+    },
+  },
+  {
+    id: 'balanced',
+    label: 'Balanced',
+    risk: 'Normal',
+    description: 'Everyday use',
+    values: {
+      max_concurrent_tasks: 2,
+      max_concurrent_items: 3,
+      max_global_items: 6,
+      max_concurrent_per_host: 3,
+      max_extract_concurrency: 4,
+      request_timeout_seconds: 30,
+    },
+  },
+  {
+    id: 'aggressive',
+    label: 'Aggressive',
+    risk: 'Risky',
+    description: 'Fast CDNs only',
+    values: {
+      max_concurrent_tasks: 4,
+      max_concurrent_items: 8,
+      max_global_items: 24,
+      max_concurrent_per_host: 8,
+      max_extract_concurrency: 12,
+      request_timeout_seconds: 30,
+    },
+  },
+]
 
 const formatBytes = (bytes) => {
   if (!bytes) return '0 B'
@@ -396,8 +440,57 @@ function App() {
       {showSettings && draftSettings && (
         <Modal onClose={() => setShowSettings(false)} width="460px">
           <h2>Settings</h2>
-          <label>Download directory<input className="input-field" value={draftSettings.download_dir || ''} onChange={(event) => setDraftSettings({ ...draftSettings, download_dir: event.target.value })} /></label>
+          <label>Download directory
+            <div className="directory-field">
+              <input className="input-field" value={draftSettings.download_dir || ''} onChange={(event) => setDraftSettings({ ...draftSettings, download_dir: event.target.value })} />
+              <button
+                className="btn directory-open"
+                type="button"
+                title="Open download directory"
+                disabled={!draftSettings.download_dir?.trim()}
+                onClick={async () => {
+                  try {
+                    const response = await apiFetch('/settings/open-download-directory', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ directory: draftSettings.download_dir }),
+                    })
+                    const data = await response.json()
+                    setDraftSettings((current) => ({ ...current, download_dir: data.directory }))
+                  } catch (error) {
+                    window.alert(error.message)
+                  }
+                }}
+              >
+                <FolderOpen size={16} /><span>Open</span>
+              </button>
+            </div>
+          </label>
           <label className="check"><input type="checkbox" checked={draftSettings.use_playwright ?? true} onChange={(event) => setDraftSettings({ ...draftSettings, use_playwright: event.target.checked })} /> Allow Playwright fallback</label>
+          <section className="preset-section" aria-labelledby="performance-preset-title">
+            <div className="preset-heading">
+              <strong id="performance-preset-title">Performance preset</strong>
+              <small>Choose a starting point, review the values, then Save.</small>
+            </div>
+            <div className="preset-grid">
+              {CONCURRENCY_PRESETS.map((preset) => {
+                const selected = Object.entries(preset.values).every(([key, value]) => draftSettings[key] === value)
+                return (
+                  <button
+                    className={`preset-card preset-${preset.id}${selected ? ' selected' : ''}`}
+                    type="button"
+                    key={preset.id}
+                    aria-pressed={selected}
+                    title={`${preset.label}: ${preset.description}`}
+                    onClick={() => setDraftSettings((current) => ({ ...current, ...preset.values }))}
+                  >
+                    <span><strong>{preset.label}</strong><em>{preset.risk}</em></span>
+                    <small>{preset.description}</small>
+                  </button>
+                )
+              })}
+            </div>
+          </section>
           {[
             ['max_concurrent_tasks', 'Concurrent tasks', 1, 20],
             ['max_concurrent_items', 'Workers per task', 1, 50],

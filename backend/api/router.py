@@ -80,6 +80,18 @@ def _safe_output_path(task):
     return base, task_output_path(str(base), task.title or "Unknown Album")
 
 
+def _open_directory(path):
+    if os.name == "nt":
+        os.startfile(str(path))
+        return
+
+    import subprocess
+    import sys
+
+    command = "open" if sys.platform == "darwin" else "xdg-open"
+    subprocess.Popen([command, str(path)])
+
+
 async def _validate_proxy_url(raw_url):
     parsed = urllib.parse.urlparse(raw_url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username:
@@ -327,12 +339,7 @@ def open_task_folder(task_id: str, db: Session = Depends(get_db)):
     _base, output_path = _safe_output_path(task)
     if not output_path.exists():
         raise HTTPException(status_code=404, detail="Output folder does not exist")
-    if os.name == "nt":
-        os.startfile(output_path)
-    else:
-        import subprocess
-
-        subprocess.Popen(["xdg-open", str(output_path)])
+    _open_directory(output_path)
     return {"status": "ok"}
 
 
@@ -416,6 +423,30 @@ class SettingsUpdate(BaseModel):
     max_extract_concurrency: int = Field(default=8, ge=1, le=50)
     request_timeout_seconds: int = Field(default=30, ge=5, le=300)
     ui_scale: float = Field(default=1.0, ge=0.5, le=1.5)
+
+
+class OpenDownloadDirectoryRequest(BaseModel):
+    directory: str = Field(min_length=1, max_length=4096)
+
+
+@router.post("/settings/open-download-directory")
+def open_download_directory(req: OpenDownloadDirectoryRequest):
+    try:
+        directory = (
+            Path(os.path.expandvars(req.directory))
+            .expanduser()
+            .resolve(strict=False)
+        )
+        directory.mkdir(parents=True, exist_ok=True)
+        if not directory.is_dir():
+            raise OSError("Path is not a directory")
+        _open_directory(directory)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not open download directory: {exc}",
+        ) from exc
+    return {"status": "ok", "directory": str(directory)}
 
 
 @router.get("/settings")
