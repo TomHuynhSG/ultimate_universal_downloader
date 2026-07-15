@@ -94,7 +94,9 @@ class HitomiExtractor(BaseExtractor):
             raise RuntimeError(f"Gallery {gallery_id} is blocked")
 
         raw_title = data.get("title") or data.get("japanese_title") or f"Hitomi Gallery {gallery_id}"
-        artists = [entry.get("artist") for entry in data.get("artists", []) if entry.get("artist")]
+        artists = [entry.get("artist") for entry in data.get("artists") or [] if entry.get("artist")]
+        if not artists:
+            artists = [entry.get("group") for entry in data.get("groups") or [] if entry.get("group")]
         artist_suffix = f" by {', '.join(name.title() for name in artists)}" if artists else ""
         gallery_title = sanitize_component(
             f"{raw_title}{artist_suffix} ({gallery_id})",
@@ -240,6 +242,7 @@ class HitomiExtractor(BaseExtractor):
                     galleryId => ({
                       title: galleryinfo.title || galleryinfo.japanese_title,
                       artists: (galleryinfo.artists || []).map(value => value.artist),
+                      groups: (galleryinfo.groups || []).map(value => value.group),
                       items: galleryinfo.files.map(file => ({
                         url: url_from_url_from_hash(galleryId, file, 'webp'),
                         filename: file.name.replace(/\.[^/.]+$/, '.webp'),
@@ -251,7 +254,7 @@ class HitomiExtractor(BaseExtractor):
                 )
             finally:
                 await browser.close()
-        artists = payload.get("artists") or []
+        artists = payload.get("artists") or payload.get("groups") or []
         suffix = f" by {', '.join(name.title() for name in artists)}" if artists else ""
         self.title = sanitize_component(
             f"{payload.get('title') or 'Hitomi Gallery'}{suffix} ({gallery_id})",
