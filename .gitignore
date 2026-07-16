@@ -44,3 +44,4 @@ step*.py
 *.png
 gg.js
 common.js
+downloads.db-wal
