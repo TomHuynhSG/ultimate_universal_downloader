@@ -78,7 +78,8 @@ class EightMusesExtractor(BaseExtractor):
         page_results = await bounded_map(
             remaining_page_numbers,
             lambda page: self.get_page_data(session, self.page_url(current_url, page)),
-            limit=min(6, get_settings()["max_extract_concurrency"]),
+            limit=6,
+            runtime_limited=True,
             return_exceptions=True,
         )
         page_data = [data] + [result for result in page_results if isinstance(result, dict)]
@@ -105,7 +106,8 @@ class EightMusesExtractor(BaseExtractor):
         album_results = await bounded_map(
             albums,
             fetch_album,
-            limit=min(4, get_settings()["max_extract_concurrency"]),
+            limit=4,
+            runtime_limited=True,
             return_exceptions=True,
         )
         self.extraction_errors.extend(

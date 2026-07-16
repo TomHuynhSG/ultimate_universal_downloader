@@ -203,7 +203,7 @@ class AllMangaExtractor(BaseExtractor):
                 async with sem:
                     return await self.extract_single(session, manga_id, chap)
                     
-            results = await bounded_map(available_chapters, fetch_chapter, limit=5)
+            results = await bounded_map(available_chapters, fetch_chapter, limit=5, runtime_limited=True)
             
             for res in results:
                 all_items.extend(res)

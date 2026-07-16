@@ -92,6 +92,20 @@ def _open_directory(path):
     subprocess.Popen([command, str(path)])
 
 
+def _remove_tree_with_retries(path, *, attempts=5, initial_delay=0.05):
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            last_error = exc
+        if not path.exists():
+            return
+        if attempt + 1 < attempts:
+            time.sleep(initial_delay * (2**attempt))
+    raise last_error or OSError(f"Could not remove {path}")
+
+
 async def _validate_proxy_url(raw_url):
     parsed = urllib.parse.urlparse(raw_url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username:
@@ -344,7 +358,11 @@ def open_task_folder(task_id: str, db: Session = Depends(get_db)):
 
 
 @router.delete("/downloads/{task_id}")
-def delete_task(task_id: str, delete_files: bool = False, db: Session = Depends(get_db)):
+async def delete_task(
+    task_id: str,
+    delete_files: bool = False,
+    db: Session = Depends(get_db),
+):
     task = db.query(DownloadTask).filter(DownloadTask.id == task_id).first()
     if not task:
         return {"status": "ok"}
@@ -355,9 +373,25 @@ def delete_task(task_id: str, delete_files: bool = False, db: Session = Depends(
             status_code=409,
             detail="This task used the shared download directory; automatic directory deletion is unsafe.",
         )
-    manager.cancel_task(task_id)
+
+    stopped = await manager.cancel_task_and_wait(task_id, timeout=30)
+    if not stopped:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The task is still closing active files. "
+                "Wait a moment and try deleting it again."
+            ),
+        )
+
     if delete_files and output_path.exists():
-        shutil.rmtree(output_path)
+        try:
+            await asyncio.to_thread(_remove_tree_with_retries, output_path)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"The task stopped, but its files could not be removed: {exc}",
+            ) from exc
 
     log_path = PROJECT_ROOT / "task_logs" / f"{task.id}.log"
     try:
@@ -455,5 +489,7 @@ def api_get_settings():
 
 
 @router.post("/settings")
-def api_update_settings(req: SettingsUpdate):
-    return {"status": "ok", "settings": save_settings(req.model_dump())}
+async def api_update_settings(req: SettingsUpdate):
+    settings = save_settings(req.model_dump())
+    runtime = await DownloadManager.get_instance().apply_runtime_settings(settings)
+    return {"status": "ok", "settings": settings, "runtime": runtime}

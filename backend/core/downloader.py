@@ -14,6 +14,7 @@ import aiofiles
 from curl_cffi.requests import AsyncSession
 
 from backend.core.config import get_settings
+from backend.core.limits import ResizableLimiter
 from backend.core.media import MediaProcessor
 from backend.core.paths import (
     PROJECT_ROOT,
@@ -24,6 +25,7 @@ from backend.core.paths import (
 )
 from backend.database.models import DownloadTask, SessionLocal
 from backend.plugins.manager import PluginManager
+from backend.plugins.utils import resize_runtime_extraction_limit
 
 
 RETRYABLE_STATUSES = {408, 425, 429, 500, 502, 503, 504}
@@ -172,6 +174,9 @@ class DownloadManager:
         self.loop = None
         self.dispatcher_task = None
         self.running_tasks = set()
+        self.task_handles = {}
+        self.task_item_limiters = {}
+        self.item_limit = 1
         self.task_events = {}
         self.cancelled_tasks = set()
         self.global_item_semaphore = None
@@ -184,8 +189,9 @@ class DownloadManager:
             return
         self.loop = asyncio.get_running_loop()
         settings = get_settings()
-        self.task_semaphore = asyncio.Semaphore(settings["max_concurrent_tasks"])
-        self.global_item_semaphore = asyncio.Semaphore(settings["max_global_items"])
+        self.task_semaphore = ResizableLimiter(settings["max_concurrent_tasks"])
+        self.global_item_semaphore = ResizableLimiter(settings["max_global_items"])
+        self.item_limit = settings["max_concurrent_items"]
         self.host_limit = settings["max_concurrent_per_host"]
         self.host_semaphores = {}
         self.dispatcher_task = asyncio.create_task(self._dispatcher(), name="download-dispatcher")
@@ -197,6 +203,59 @@ class DownloadManager:
         for item in recovered:
             self.queue.put_nowait(item)
 
+    async def apply_runtime_settings(self, settings):
+        running_loop = asyncio.get_running_loop()
+        if self.loop and self.loop.is_running() and self.loop is not running_loop:
+            future = asyncio.run_coroutine_threadsafe(
+                self._apply_runtime_settings_local(settings), self.loop
+            )
+            return await asyncio.wrap_future(future)
+        return await self._apply_runtime_settings_local(settings)
+
+    async def _apply_runtime_settings_local(self, settings):
+        self.item_limit = settings["max_concurrent_items"]
+        self.host_limit = settings["max_concurrent_per_host"]
+        resize_operations = [
+            resize_runtime_extraction_limit(settings["max_extract_concurrency"])
+        ]
+        if self.task_semaphore:
+            resize_operations.append(
+                self.task_semaphore.resize(settings["max_concurrent_tasks"])
+            )
+        if self.global_item_semaphore:
+            resize_operations.append(
+                self.global_item_semaphore.resize(settings["max_global_items"])
+            )
+        resize_operations.extend(
+            limiter.resize(self.host_limit)
+            for limiter in list(self.host_semaphores.values())
+        )
+        resize_operations.extend(
+            limiter.resize(self.item_limit)
+            for limiter in list(self.task_item_limiters.values())
+        )
+        results = await asyncio.gather(*resize_operations)
+        extraction = results[0]
+
+        task_active = self.task_semaphore.active if self.task_semaphore else 0
+        global_active = (
+            self.global_item_semaphore.active if self.global_item_semaphore else 0
+        )
+        draining = (
+            bool(self.task_semaphore and self.task_semaphore.draining)
+            or bool(self.global_item_semaphore and self.global_item_semaphore.draining)
+            or any(limiter.draining for limiter in self.host_semaphores.values())
+            or any(limiter.draining for limiter in self.task_item_limiters.values())
+            or extraction["draining"]
+        )
+        return {
+            "applied_live": True,
+            "draining": draining,
+            "active_tasks": task_active,
+            "active_downloads": global_active,
+            "active_extractions": extraction["active"],
+        }
+
     async def stop(self):
         if self.dispatcher_task:
             self.dispatcher_task.cancel()
@@ -206,15 +265,22 @@ class DownloadManager:
         if self.dispatcher_task:
             await asyncio.gather(self.dispatcher_task, return_exceptions=True)
         self.running_tasks.clear()
+        self.task_handles.clear()
+        self.task_item_limiters.clear()
         self.dispatcher_task = None
 
     def enqueue(self, task_id, url):
         item = (task_id, url)
         if self.loop and self.loop.is_running():
-            self.loop.call_soon_threadsafe(self.queue.put_nowait, item)
+            self.loop.call_soon_threadsafe(self._enqueue_item, item)
         else:
             with self._pending_lock:
                 self._pending_before_start.append(item)
+
+    def _enqueue_item(self, item):
+        task_id, _url = item
+        self._forget_task(task_id)
+        self.queue.put_nowait(item)
 
     def _schedule_control(self, callback, *args):
         if self.loop and self.loop.is_running():
@@ -236,6 +302,23 @@ class DownloadManager:
     def _cancel_task(self, task_id):
         self.cancelled_tasks.add(task_id)
         self.task_events.setdefault(task_id, asyncio.Event()).set()
+
+    async def cancel_task_and_wait(self, task_id, timeout=30):
+        running_loop = asyncio.get_running_loop()
+        if self.loop and self.loop.is_running() and self.loop is not running_loop:
+            future = asyncio.run_coroutine_threadsafe(
+                self._cancel_task_and_wait_local(task_id, timeout), self.loop
+            )
+            return await asyncio.wrap_future(future)
+        return await self._cancel_task_and_wait_local(task_id, timeout)
+
+    async def _cancel_task_and_wait_local(self, task_id, timeout):
+        self._cancel_task(task_id)
+        task = self.task_handles.get(task_id)
+        if not task:
+            return True
+        done, _pending = await asyncio.wait({task}, timeout=max(0, timeout))
+        return task in done
 
     async def wait_until_runnable(self, task_id):
         event = self.task_events.setdefault(task_id, asyncio.Event())
@@ -288,7 +371,7 @@ class DownloadManager:
     async def download_slot(self, url):
         hostname = (urllib.parse.urlparse(url).hostname or "unknown").lower()
         host_semaphore = self.host_semaphores.setdefault(
-            hostname, asyncio.Semaphore(self.host_limit)
+            hostname, ResizableLimiter(self.host_limit)
         )
         async with host_semaphore:
             async with self.global_item_semaphore:
@@ -301,13 +384,23 @@ class DownloadManager:
             await self.task_semaphore.acquire()
             task = asyncio.create_task(self._run_queued_task(task_id, url))
             self.running_tasks.add(task)
-            task.add_done_callback(self.running_tasks.discard)
+            self.task_handles[task_id] = task
+            task.add_done_callback(
+                lambda completed, current_id=task_id: self._task_finished(
+                    current_id, completed
+                )
+            )
+
+    def _task_finished(self, task_id, task):
+        self.running_tasks.discard(task)
+        if self.task_handles.get(task_id) is task:
+            self.task_handles.pop(task_id, None)
 
     async def _run_queued_task(self, task_id, url):
         try:
             await self._process_single_task(task_id, url)
         finally:
-            self.task_semaphore.release()
+            await self.task_semaphore.release()
             self.queue.task_done()
 
     async def _process_single_task(self, task_id, url):
@@ -317,7 +410,11 @@ class DownloadManager:
         try:
             logger.log(f"Initialized processing for URL: {url}")
             snapshot = await asyncio.to_thread(_task_snapshot, task_id)
-            if not snapshot or snapshot["status"] in {"deleted", "cancelled"}:
+            if (
+                self.is_task_cancelled(task_id)
+                or not snapshot
+                or snapshot["status"] in {"deleted", "cancelled"}
+            ):
                 logger.log("Task was deleted while waiting in the queue. Skipping.")
                 return
 
@@ -327,7 +424,7 @@ class DownloadManager:
                 existing_details = {}
             cancelled = existing_details.get("_cancelled", [])
             self.load_cancelled_chapters(task_id, cancelled)
-            self.cancelled_tasks.discard(task_id)
+
             event = self.task_events.setdefault(task_id, asyncio.Event())
             event.set()
 
@@ -434,11 +531,14 @@ class DownloadManager:
                 )
 
                 logger.log(f"Extracted {total} files. Target directory: {output_path}")
-                worker_count = min(total, settings["max_concurrent_items"])
+                item_limiter = ResizableLimiter(self.item_limit)
+                self.task_item_limiters[task_id] = item_limiter
+                worker_count = min(total, 50)
                 logger.log(
-                    f"Starting {worker_count} per-task workers "
-                    f"({settings['max_global_items']} global, "
-                    f"{settings['max_concurrent_per_host']} per host)."
+                    f"Starting {worker_count} queue workers "
+                    f"({item_limiter.limit} active per task, "
+                    f"{self.global_item_semaphore.limit} global, "
+                    f"{self.host_limit} per host)."
                 )
 
                 state_lock = asyncio.Lock()
@@ -484,15 +584,16 @@ class DownloadManager:
                             folder = "" if isinstance(item, str) else item.get("folder", "")
                             folder_name = folder or "Media"
                             try:
-                                result, file_size = await self._download_item(
-                                    session,
-                                    task_id,
-                                    url,
-                                    output_path,
-                                    index,
-                                    item,
-                                    logger,
-                                )
+                                async with item_limiter:
+                                    result, file_size = await self._download_item(
+                                        session,
+                                        task_id,
+                                        url,
+                                        output_path,
+                                        index,
+                                        item,
+                                        logger,
+                                    )
                             except Exception as exc:
                                 logger.log(f"ERROR: Worker failed for item {index + 1}: {exc}")
                                 result, file_size = "failed", 0
@@ -540,7 +641,11 @@ class DownloadManager:
                 await updater
 
                 snapshot = await asyncio.to_thread(_task_snapshot, task_id)
-                if not snapshot or snapshot["status"] in {"deleted", "cancelled"}:
+                if (
+                    self.is_task_cancelled(task_id)
+                    or not snapshot
+                    or snapshot["status"] in {"deleted", "cancelled"}
+                ):
                     logger.log("Task was cancelled or deleted during download.")
                     return
 
@@ -596,6 +701,7 @@ class DownloadManager:
                     details=json.dumps(details),
                 )
         finally:
+            self.task_item_limiters.pop(task_id, None)
             self._forget_task(task_id)
             await logger.close()
 

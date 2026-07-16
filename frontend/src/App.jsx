@@ -502,7 +502,7 @@ function App() {
             <label key={key}>{label}<input className="input-field compact" type="number" min={min} max={max} value={draftSettings[key]} onChange={(event) => setDraftSettings({ ...draftSettings, [key]: Number(event.target.value) })} /></label>
           ))}
           <label>UI scale: {draftSettings.ui_scale || 1}×<input type="range" min="0.5" max="1.5" step="0.1" value={draftSettings.ui_scale || 1} onChange={(event) => setDraftSettings({ ...draftSettings, ui_scale: Number(event.target.value) })} /></label>
-          <small>Engine concurrency changes take effect after restarting the app.</small>
+          <small>Concurrency changes apply live. Lower limits let active work finish, then drain to the new limit.</small>
           <div className="modal-actions"><button className="btn" onClick={() => setShowSettings(false)}>Cancel</button><button className="btn btn-primary" onClick={async () => { const response = await apiFetch('/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(draftSettings) }); const data = await response.json(); setSettings(data.settings); setShowSettings(false) }}>Save</button></div>
         </Modal>
       )}

@@ -27,6 +27,19 @@ class HitomiExtractor(BaseExtractor):
         match = re.search(r"-(\d+)\.html|/galleries/(\d+)\.html|/reader/(\d+)\.html", url)
         return next((group for group in match.groups() if group), None) if match else None
 
+    @staticmethod
+    def _parse_resolver(script):
+        mapping = {}
+        block_pattern = r"((?:\s*case\s+\d+\s*:\s*)+)o\s*=\s*(\d+)\s*;\s*break\s*;"
+        for cases, value in re.findall(block_pattern, script):
+            for number in re.findall(r"case\s+(\d+)", cases):
+                mapping[int(number)] = int(value)
+        default_match = re.search(r"var\s+o\s*=\s*(\d+)\s*;", script)
+        base_match = re.search(r"b:\s*'([^']+)'", script)
+        if not default_match or not base_match or not mapping:
+            raise RuntimeError("Hitomi resolver format was not recognized")
+        return mapping, int(default_match.group(1)), base_match.group(1)
+
     @classmethod
     async def _load_resolver(cls, session, *, force=False):
         if cls._resolver_lock is None:
@@ -42,26 +55,17 @@ class HitomiExtractor(BaseExtractor):
             if response.status_code != 200:
                 raise RuntimeError(f"Hitomi resolver returned HTTP {response.status_code}")
 
-            mapping = {}
-            block_pattern = r"((?:\s*case\s+\d+\s*:\s*)+)o\s*=\s*(\d+)\s*;\s*break\s*;"
-            for cases, value in re.findall(block_pattern, response.text):
-                for number in re.findall(r"case\s+(\d+)", cases):
-                    mapping[int(number)] = int(value)
-            base_match = re.search(r"b:\s*'([^']+)'", response.text)
-            if not base_match or not mapping:
-                raise RuntimeError("Hitomi resolver format was not recognized")
-
-            cls._resolver = (mapping, base_match.group(1))
+            cls._resolver = cls._parse_resolver(response.text)
             cls._resolver_loaded_at = time.monotonic()
             return cls._resolver
 
     @classmethod
     def _url_from_hash(cls, image_hash, resolver):
-        mapping, base_path = resolver
+        mapping, default_offset, base_path = resolver
         if not re.fullmatch(r"[0-9a-f]{64}", image_hash or ""):
             raise ValueError("Invalid Hitomi image hash")
         rotated = int(image_hash[-1] + image_hash[-3:-1], 16)
-        shard = 1 + mapping.get(rotated, 1)
+        shard = 1 + mapping.get(rotated, default_offset)
         return (
             f"https://w{shard}.{cls.IMAGE_DOMAIN}/"
             f"{base_path}{rotated}/{image_hash}.webp"
@@ -187,7 +191,7 @@ class HitomiExtractor(BaseExtractor):
             raise RuntimeError("Hitomi collection contained no galleries")
         self.title = await self._collection_title(session)
 
-        concurrency = get_settings()["max_extract_concurrency"]
+
 
         async def fetch(index_and_id):
             index, gallery_id = index_and_id
@@ -202,7 +206,8 @@ class HitomiExtractor(BaseExtractor):
         raw_results = await bounded_map(
             list(enumerate(gallery_ids)),
             fetch,
-            limit=concurrency,
+            limit=50,
+            runtime_limited=True,
             return_exceptions=True,
             on_progress=progress,
         )

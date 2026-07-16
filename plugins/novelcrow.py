@@ -73,7 +73,8 @@ class NovelCrowExtractor(BaseExtractor):
         results = await bounded_map(
             chapters,
             fetch_chapter,
-            limit=min(6, get_settings()["max_extract_concurrency"]),
+            limit=6,
+            runtime_limited=True,
             return_exceptions=True,
             on_progress=progress,
         )

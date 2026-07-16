@@ -98,7 +98,7 @@ The Settings page provides these three presets as one-click starting points; sel
 
 These are **concurrency** controls, not requests-per-second controls. A value of 1 prevents overlap but can still send sequential requests back-to-back. If a website requires a fixed delay, its plugin should implement shared asynchronous pacing with `asyncio.sleep()` or a rate limiter. Increasing the timeout only lets a slow request remain open longer; it does not make requests gentler and an unnecessarily low timeout can cause extra retries.
 
-Engine-level concurrency changes take effect after restarting the application.
+Concurrency changes apply immediately after **Save**. When a limit is lowered below current activity, in-flight work is allowed to finish and the engine temporarily blocks replacement work until usage drains to the new limit. Increasing a limit wakes queued work immediately. Request-timeout changes apply to new download items and new extraction phases; they do not alter requests already in flight.
 
 ## Writing an Optimized Plugin
 

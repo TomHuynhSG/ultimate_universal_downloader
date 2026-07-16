@@ -57,7 +57,8 @@ class LusciousExtractor(BaseExtractor):
         page_results = await bounded_map(
             range(2, max_page + 1),
             fetch_page,
-            limit=min(6, settings["max_extract_concurrency"]),
+            limit=6,
+            runtime_limited=True,
             return_exceptions=True,
         )
         self.extraction_errors = [
@@ -100,7 +101,8 @@ class LusciousExtractor(BaseExtractor):
         results = await bounded_map(
             list(enumerate(thumbnails)),
             probe,
-            limit=min(20, settings["max_extract_concurrency"]),
+            limit=20,
+            runtime_limited=True,
             return_exceptions=True,
             on_progress=progress,
         )

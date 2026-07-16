@@ -95,7 +95,7 @@ class EHentaiExtractor(BaseExtractor):
                     print(f"Failed to extract e-hentai image page: {e}")
                 return None
                 
-        results = await bounded_map(image_page_items, fetch_real_img, limit=3)
+        results = await bounded_map(image_page_items, fetch_real_img, limit=3, runtime_limited=True)
         
         for res in results:
             if res:

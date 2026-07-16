@@ -96,7 +96,8 @@ class MangaHereExtractor(BaseExtractor):
         results = await bounded_map(
             chapter_urls,
             fetch_chapter,
-            limit=min(5, get_settings()["max_extract_concurrency"]),
+            limit=5,
+            runtime_limited=True,
             return_exceptions=True,
             on_progress=progress,
         )
