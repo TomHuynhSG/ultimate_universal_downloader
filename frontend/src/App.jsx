@@ -253,9 +253,12 @@ function App() {
   const [logsModal, setLogsModal] = useState(null)
   const [settings, setSettings] = useState({ ui_scale: 1 })
   const [draftSettings, setDraftSettings] = useState(null)
+  const [toast, setToast] = useState(null)
   const downloadsRef = useRef(downloads)
   const payloadRef = useRef('')
   const scaleSaveTimer = useRef(null)
+  const toastTimer = useRef(null)
+  const toastSequence = useRef(0)
 
   useEffect(() => { downloadsRef.current = downloads }, [downloads])
 
@@ -307,29 +310,40 @@ function App() {
   }, [])
 
   const submitDownload = useCallback(async (targetUrl) => {
-    if (!targetUrl) return
+    if (!targetUrl) return false
     const duplicate = downloadsRef.current.some((task) => task.url === targetUrl)
-    if (duplicate && !window.confirm('This URL is already in your tasks. Download it again?')) return
+    if (duplicate && !window.confirm('This URL is already in your tasks. Download it again?')) return false
     await apiFetch('/downloads', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url: targetUrl }),
     })
     setUrl('')
+    return true
   }, [])
 
+  const showToast = useCallback((message) => {
+    window.clearTimeout(toastTimer.current)
+    toastSequence.current += 1
+    setToast({ id: toastSequence.current, message })
+    toastTimer.current = window.setTimeout(() => setToast(null), 1500)
+  }, [])
+
+  useEffect(() => () => window.clearTimeout(toastTimer.current), [])
   useEffect(() => {
     const paste = (event) => {
       if (['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName)) return
       const value = event.clipboardData?.getData('Text')?.trim()
       if (value?.startsWith('http://') || value?.startsWith('https://')) {
         event.preventDefault()
-        submitDownload(value).catch((error) => window.alert(error.message))
+        submitDownload(value)
+          .then((queued) => queued && showToast('Link added to download queue'))
+          .catch((error) => window.alert(error.message))
       }
     }
     window.addEventListener('paste', paste)
     return () => window.removeEventListener('paste', paste)
-  }, [submitDownload])
+  }, [showToast, submitDownload])
 
   useEffect(() => {
     const wheel = (event) => {
@@ -382,6 +396,9 @@ function App() {
 
   return (
     <div className="container" style={{ padding: '0 2rem 2rem', maxWidth: '1200px', margin: '0 auto', zoom: settings.ui_scale || 1 }}>
+      <div className="toast-region" aria-live="polite" aria-atomic="true">
+        {toast && <div className="quick-toast" key={toast.id} role="status">{toast.message}</div>}
+      </div>
       <div className="sticky-header">
         <header className="app-header">
           <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>

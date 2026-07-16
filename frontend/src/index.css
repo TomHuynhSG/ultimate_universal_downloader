@@ -37,6 +37,9 @@ p svg { margin-right: 4px; vertical-align: -2px; }
 .btn-primary { border: none; background: var(--accent-primary); box-shadow: 0 4px 14px var(--accent-glow); }
 .btn-primary:hover { background: var(--accent-hover); }
 .danger { color: #fca5a5 !important; }
+.toast-region { position: fixed; z-index: 200; top: 18px; left: 50%; width: max-content; max-width: calc(100vw - 32px); transform: translateX(-50%); pointer-events: none; user-select: none; }
+.quick-toast { padding: 13.5px 21px; border: 1px solid rgba(52, 211, 153, .45); border-radius: 999px; color: #d1fae5; background: rgba(6, 78, 59, .94); box-shadow: 0 10px 30px rgba(0, 0, 0, .28); font-size: 1.23rem; font-weight: 600; white-space: nowrap; animation: quick-toast-life 1.5s ease forwards; pointer-events: none; }
+@keyframes quick-toast-life { 0% { opacity: 0; transform: translateY(-8px) scale(.98); } 12%, 72% { opacity: 1; transform: translateY(0) scale(1); } 100% { opacity: 0; transform: translateY(-4px) scale(.99); } }
 form label, .modal-backdrop label { display: grid; gap: 7px; margin-bottom: 12px; color: var(--text-muted); font-size: .88rem; }
 form > label { display: flex; align-items: center; color: white; }
 .input-group { display: flex; width: 100%; gap: 12px; }
