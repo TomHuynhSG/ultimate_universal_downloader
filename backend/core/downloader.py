@@ -4,6 +4,7 @@ import asyncio
 import datetime
 import json
 import os
+import re
 import threading
 import time
 import urllib.parse
@@ -730,6 +731,8 @@ class DownloadManager:
             return "cancelled", 0
 
         media_type = "" if isinstance(item, str) else item.get("type", "")
+        convert_to = "" if isinstance(item, str) else item.get("convert_to", "")
+        fallback_url = None if isinstance(item, str) else item.get("fallback_url")
         explicit_filename = None if isinstance(item, str) else item.get("filename")
         url_path = urllib.parse.unquote(urllib.parse.urlparse(image_url).path)
         url_name = Path(url_path).name
@@ -757,8 +760,22 @@ class DownloadManager:
         headers = {"Referer": referer or task_url}
         timeout = get_settings()["request_timeout_seconds"]
 
+        part_path = (
+            file_path.with_name(f"{file_path.stem}.part{file_path.suffix}")
+            if is_hls
+            else file_path.with_name(f"{file_path.name}.part")
+        )
+        if not is_hls:
+            # Resume only bytes written by this invocation. A partial file left
+            # by an older run may refer to different content at the same URL.
+            await asyncio.to_thread(part_path.unlink, missing_ok=True)
+
         for attempt in range(3):
-            part_path = (file_path.with_name(f"{file_path.stem}.part{file_path.suffix}") if is_hls else file_path.with_name(f"{file_path.name}.part"))
+            if self.is_task_cancelled(task_id) or self.is_chapter_cancelled(
+                task_id, folder_name
+            ):
+                await asyncio.to_thread(part_path.unlink, missing_ok=True)
+                return "cancelled", 0
             try:
                 if is_hls:
                     async with self.download_slot(image_url):
@@ -776,61 +793,156 @@ class DownloadManager:
                     logger.log(f"SUCCESS: Downloaded {filename} ({size} bytes)")
                     return "success", size
 
+                request_headers = dict(headers)
+                resume_from = 0
+                if attempt and await asyncio.to_thread(part_path.is_file):
+                    partial_stat = await asyncio.to_thread(part_path.stat)
+                    resume_from = partial_stat.st_size
+                    if resume_from:
+                        request_headers["Range"] = f"bytes={resume_from}-"
+
                 async with self.download_slot(image_url):
                     async with session.stream(
                         "GET",
                         image_url,
-                        headers=headers,
+                        headers=request_headers,
                         timeout=timeout,
                         allow_redirects=True,
                     ) as response:
+                        if response.status_code == 416 and resume_from:
+                            await asyncio.to_thread(part_path.unlink, missing_ok=True)
+                            raise RuntimeError(
+                                f"retry:0:Server rejected resume for {filename}"
+                            )
                         if response.status_code in RETRYABLE_STATUSES:
                             retry_after = response.headers.get("retry-after")
                             delay = float(retry_after) if retry_after and retry_after.isdigit() else 2**attempt
                             raise RuntimeError(
                                 f"retry:{delay}:HTTP {response.status_code} for {filename}"
                             )
-                        if response.status_code != 200:
+                        if response.status_code not in {200, 206}:
+                            await asyncio.to_thread(part_path.unlink, missing_ok=True)
                             logger.log(
                                 f"ERROR: HTTP {response.status_code} while downloading {image_url}"
                             )
                             return "failed", 0
+                        write_mode = "wb"
+                        initial_size = 0
+                        if resume_from and response.status_code == 206:
+                            content_range = response.headers.get("content-range", "")
+                            range_match = re.match(
+                                r"bytes\s+(\d+)-\d+/(?:\d+|\*)$", content_range
+                            )
+                            if not range_match or int(range_match.group(1)) != resume_from:
+                                await asyncio.to_thread(part_path.unlink, missing_ok=True)
+                                raise RuntimeError(
+                                    f"retry:0:Invalid resume response for {filename}"
+                                )
+                            write_mode = "ab"
+                            initial_size = resume_from
+                            logger.log(f"RESUMING: {filename} from {resume_from} bytes")
                         content_type = response.headers.get("content-type", "").lower()
                         if content_type.startswith("text/html") or content_type.startswith(
                             "application/json"
                         ):
+                            await asyncio.to_thread(part_path.unlink, missing_ok=True)
                             logger.log(
                                 f"ERROR: Unexpected {content_type} response for {filename}"
                             )
                             return "failed", 0
                         expected = response.headers.get("content-length")
                         expected_size = (int(expected) if expected and expected.isdigit() and not response.headers.get("content-encoding") else None)
-                        written = 0
+                        response_written = 0
                         cancelled_during_transfer = False
-                        async with aiofiles.open(part_path, "wb") as handle:
+                        async with aiofiles.open(part_path, write_mode) as handle:
                             async for chunk in response.aiter_content(chunk_size=256 * 1024):
                                 if self.is_task_cancelled(task_id) or self.is_chapter_cancelled(task_id, folder_name):
                                     cancelled_during_transfer = True
                                     break
                                 if chunk:
                                     await handle.write(chunk)
-                                    written += len(chunk)
+                                    response_written += len(chunk)
                         if cancelled_during_transfer:
                             await asyncio.to_thread(part_path.unlink, missing_ok=True)
                             return "cancelled", 0
-                        if expected_size is not None and written != expected_size:
+                        if expected_size is not None and response_written != expected_size:
                             raise RuntimeError(
                                 f"retry:{2**attempt}:Incomplete {filename}: "
-                                f"expected {expected_size}, received {written}"
+                                f"expected {expected_size}, received {response_written}"
                             )
+                        written = initial_size + response_written
                         if written <= 0:
                             raise RuntimeError(f"retry:{2**attempt}:Empty response for {filename}")
+
+                if convert_to:
+                    converted_path = file_path.with_name(
+                        f"{file_path.stem}.converted.part{file_path.suffix}"
+                    )
+                    await asyncio.to_thread(converted_path.unlink, missing_ok=True)
+                    try:
+                        if convert_to != "gif":
+                            raise RuntimeError(
+                                f"Unsupported conversion target: {convert_to}"
+                            )
+                        await asyncio.to_thread(
+                            MediaProcessor.convert_to_gif,
+                            part_path,
+                            converted_path,
+                        )
+                        if self.is_task_cancelled(
+                            task_id
+                        ) or self.is_chapter_cancelled(task_id, folder_name):
+                            await asyncio.to_thread(part_path.unlink, missing_ok=True)
+                            await asyncio.to_thread(
+                                converted_path.unlink, missing_ok=True
+                            )
+                            return "cancelled", 0
+                        await asyncio.to_thread(part_path.unlink, missing_ok=True)
+                        await asyncio.to_thread(
+                            os.replace, converted_path, file_path
+                        )
+                        converted_size = (
+                            await asyncio.to_thread(file_path.stat)
+                        ).st_size
+                        logger.log(
+                            f"SUCCESS: Downloaded and converted {filename} "
+                            f"({converted_size} bytes)"
+                        )
+                        return "success", converted_size
+                    except Exception as conversion_error:
+                        await asyncio.to_thread(part_path.unlink, missing_ok=True)
+                        await asyncio.to_thread(
+                            converted_path.unlink, missing_ok=True
+                        )
+                        if fallback_url:
+                            logger.log(
+                                f"WARN: Could not convert {filename}: "
+                                f"{conversion_error}. Downloading original GIF..."
+                            )
+                            fallback_item = dict(item)
+                            fallback_item["url"] = fallback_url
+                            fallback_item.pop("convert_to", None)
+                            fallback_item.pop("fallback_url", None)
+                            return await self._download_item(
+                                session,
+                                task_id,
+                                task_url,
+                                output_path,
+                                index,
+                                fallback_item,
+                                logger,
+                            )
+                        raise RuntimeError(
+                            f"Media conversion failed: {conversion_error}"
+                        ) from conversion_error
 
                 await asyncio.to_thread(os.replace, part_path, file_path)
                 logger.log(f"SUCCESS: Downloaded {filename} ({written} bytes)")
                 return "success", written
             except Exception as exc:
-                if await asyncio.to_thread(part_path.exists):
+                if (
+                    is_hls or attempt >= 2
+                ) and await asyncio.to_thread(part_path.exists):
                     await asyncio.to_thread(part_path.unlink, missing_ok=True)
                 message = str(exc)
                 delay = 2**attempt

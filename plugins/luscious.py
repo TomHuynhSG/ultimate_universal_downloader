@@ -3,12 +3,16 @@ import re
 from bs4 import BeautifulSoup
 
 from backend.core.config import get_settings
+from backend.core.media import MediaProcessor
 from backend.plugins.base import BaseExtractor
 from backend.plugins.utils import bounded_map, deduplicate
 
 
 class LusciousExtractor(BaseExtractor):
     URLS = ["luscious.net", "www.luscious.net", "members.luscious.net"]
+    # Use MP4 as an efficient transport for GIF animations when FFmpeg is
+    # available, but always finalize those items with a .gif filename.
+    OTHER_MEDIA_EXTENSIONS = ("mp4", "jpg", "png")
 
     @staticmethod
     def thumbnails_from_html(page_html):
@@ -72,10 +76,39 @@ class LusciousExtractor(BaseExtractor):
         if not thumbnails:
             raise RuntimeError("No Luscious media thumbnails were found")
 
+        conversion_available = MediaProcessor.can_convert_to_gif()
+
         async def probe(index_and_url):
             index, thumbnail = index_and_url
             base = re.sub(r"\.\d+x\d+\.jpg$", "", thumbnail)
-            for extension in ("gif", "mp4", "jpg", "png"):
+            gif_candidate = f"{base}.gif"
+            try:
+                gif_head = await session.head(gif_candidate, timeout=timeout)
+            except Exception:
+                gif_head = None
+
+            if gif_head and gif_head.status_code == 200:
+                if conversion_available:
+                    mp4_candidate = f"{base}.mp4"
+                    try:
+                        mp4_head = await session.head(mp4_candidate, timeout=timeout)
+                    except Exception:
+                        mp4_head = None
+                    if mp4_head and mp4_head.status_code == 200:
+                        return {
+                            "url": mp4_candidate,
+                            "filename": f"{index + 1:03d}.gif",
+                            "referer": self.url,
+                            "convert_to": "gif",
+                            "fallback_url": gif_candidate,
+                        }
+                return {
+                    "url": gif_candidate,
+                    "filename": f"{index + 1:03d}.gif",
+                    "referer": self.url,
+                }
+
+            for extension in self.OTHER_MEDIA_EXTENSIONS:
                 candidate = f"{base}.{extension}"
                 try:
                     head = await session.head(candidate, timeout=timeout)

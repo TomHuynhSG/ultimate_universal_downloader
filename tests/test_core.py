@@ -18,6 +18,7 @@ from backend.core.paths import resolve_within, sanitize_component
 from backend.plugins.manager import PluginManager
 from backend.plugins.utils import bounded_map, resize_runtime_extraction_limit
 from plugins.hitomi import HitomiExtractor
+from plugins.luscious import LusciousExtractor
 
 
 class DummyLogger:
@@ -41,6 +42,82 @@ class FakeSession:
     @asynccontextmanager
     async def stream(self, *args, **kwargs):
         yield FakeResponse()
+
+
+class UrlRecordingSession:
+    def __init__(self):
+        self.urls = []
+
+    @asynccontextmanager
+    async def stream(self, *args, **kwargs):
+        self.urls.append(args[1])
+        yield FakeResponse()
+
+
+class StallingResponse:
+    def __init__(self, status_code, headers, chunks, error=None):
+        self.status_code = status_code
+        self.headers = headers
+        self.chunks = chunks
+        self.error = error
+
+    async def aiter_content(self, chunk_size=None):
+        for chunk in self.chunks:
+            yield chunk
+        if self.error:
+            raise self.error
+
+
+class ResumingSession:
+    def __init__(self):
+        self.requests = []
+        self.responses = iter(
+            [
+                StallingResponse(
+                    200,
+                    {"content-type": "image/jpeg", "content-length": "6"},
+                    [b"abc"],
+                    RuntimeError("retry:0:connection stalled"),
+                ),
+                StallingResponse(
+                    206,
+                    {
+                        "content-type": "image/jpeg",
+                        "content-length": "3",
+                        "content-range": "bytes 3-5/6",
+                    },
+                    [b"def"],
+                ),
+            ]
+        )
+
+    @asynccontextmanager
+    async def stream(self, *args, **kwargs):
+        self.requests.append(kwargs)
+        yield next(self.responses)
+
+
+class LusciousSession:
+    def __init__(self):
+        self.head_urls = []
+
+    async def get(self, *args, **kwargs):
+        class Response:
+            status_code = 200
+            text = (
+                '<html><h1>Fast album</h1><img '
+                'src="https://ah-img.luscious.net/a/1/item.315x0.jpg"></html>'
+            )
+
+        return Response()
+
+    async def head(self, url, **kwargs):
+        self.head_urls.append(url)
+
+        class Response:
+            status_code = 200
+
+        return Response()
 
 
 class PathTests(unittest.TestCase):
@@ -113,6 +190,24 @@ class HitomiTests(unittest.IsolatedAsyncioTestCase):
     async def test_artist_collection_uses_artist_as_parent_folder(self):
         extractor = HitomiExtractor("https://hitomi.la/artist/liyoosa-english.html")
         self.assertEqual(await extractor._collection_title(None), "Liyoosa")
+
+
+class LusciousTests(unittest.IsolatedAsyncioTestCase):
+    @patch("plugins.luscious.MediaProcessor.can_convert_to_gif", return_value=True)
+    async def test_uses_smaller_mp4_transport_but_outputs_gif(self, _converter):
+        session = LusciousSession()
+        extractor = LusciousExtractor("https://www.luscious.net/albums/fast_1/")
+
+        media = await extractor.extract(session)
+
+        gif_url = "https://ah-img.luscious.net/a/1/item.gif"
+        mp4_url = "https://ah-img.luscious.net/a/1/item.mp4"
+        self.assertEqual(len(media), 1)
+        self.assertEqual(media[0]["url"], mp4_url)
+        self.assertEqual(media[0]["filename"], "001.gif")
+        self.assertEqual(media[0]["convert_to"], "gif")
+        self.assertEqual(media[0]["fallback_url"], gif_url)
+        self.assertEqual(session.head_urls, [gif_url, mp4_url])
 
 
 class AsyncPipelineTests(unittest.IsolatedAsyncioTestCase):
@@ -271,6 +366,128 @@ class AsyncPipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(size, 6)
             self.assertEqual(target.read_bytes(), b"abcdef")
             self.assertFalse((Path(directory) / "image.jpg.part").exists())
+
+    async def test_download_converts_transport_to_gif_atomically(self):
+        manager = DownloadManager()
+        manager.loop = asyncio.get_running_loop()
+        manager.global_item_semaphore = asyncio.Semaphore(2)
+        manager.host_limit = 2
+        manager.host_semaphores = {}
+        manager.task_events["test-task"] = asyncio.Event()
+        manager.task_events["test-task"].set()
+        logger = DummyLogger()
+
+        def fake_convert(source, target):
+            self.assertEqual(Path(source).read_bytes(), b"abcdef")
+            Path(target).write_bytes(b"GIF89a")
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "backend.core.downloader.MediaProcessor.convert_to_gif",
+            side_effect=fake_convert,
+        ):
+            result, size = await manager._download_item(
+                FakeSession(),
+                "test-task",
+                "https://example.com/gallery",
+                Path(directory),
+                0,
+                {
+                    "url": "https://cdn.example.com/image.mp4",
+                    "filename": "image.gif",
+                    "convert_to": "gif",
+                },
+                logger,
+            )
+
+            target = Path(directory) / "image.gif"
+            self.assertEqual(result, "success")
+            self.assertEqual(size, 6)
+            self.assertEqual(target.read_bytes(), b"GIF89a")
+            self.assertFalse((Path(directory) / "image.gif.part").exists())
+            self.assertFalse(
+                (Path(directory) / "image.converted.part.gif").exists()
+            )
+
+    async def test_failed_conversion_falls_back_to_original_gif(self):
+        manager = DownloadManager()
+        manager.loop = asyncio.get_running_loop()
+        manager.global_item_semaphore = asyncio.Semaphore(2)
+        manager.host_limit = 2
+        manager.host_semaphores = {}
+        manager.task_events["test-task"] = asyncio.Event()
+        manager.task_events["test-task"].set()
+        logger = DummyLogger()
+        session = UrlRecordingSession()
+        gif_url = "https://cdn.example.com/image.gif"
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "backend.core.downloader.MediaProcessor.convert_to_gif",
+            side_effect=RuntimeError("converter unavailable"),
+        ):
+            result, size = await manager._download_item(
+                session,
+                "test-task",
+                "https://example.com/gallery",
+                Path(directory),
+                0,
+                {
+                    "url": "https://cdn.example.com/image.mp4",
+                    "filename": "image.gif",
+                    "convert_to": "gif",
+                    "fallback_url": gif_url,
+                },
+                logger,
+            )
+
+            self.assertEqual(result, "success")
+            self.assertEqual(size, 6)
+            self.assertEqual(
+                session.urls,
+                ["https://cdn.example.com/image.mp4", gif_url],
+            )
+            self.assertEqual(
+                (Path(directory) / "image.gif").read_bytes(), b"abcdef"
+            )
+            self.assertTrue(
+                any("Downloading original GIF" in message for message in logger.messages)
+            )
+
+    async def test_download_retry_resumes_partial_stream(self):
+        manager = DownloadManager()
+        manager.loop = asyncio.get_running_loop()
+        manager.global_item_semaphore = asyncio.Semaphore(2)
+        manager.host_limit = 2
+        manager.host_semaphores = {}
+        manager.task_events["test-task"] = asyncio.Event()
+        manager.task_events["test-task"].set()
+        logger = DummyLogger()
+        session = ResumingSession()
+
+        with tempfile.TemporaryDirectory() as directory:
+            result, size = await manager._download_item(
+                session,
+                "test-task",
+                "https://example.com/gallery",
+                Path(directory),
+                0,
+                {
+                    "url": "https://cdn.example.com/image.jpg",
+                    "filename": "image.jpg",
+                },
+                logger,
+            )
+
+            target = Path(directory) / "image.jpg"
+            self.assertEqual(result, "success")
+            self.assertEqual(size, 6)
+            self.assertEqual(target.read_bytes(), b"abcdef")
+            self.assertNotIn("Range", session.requests[0]["headers"])
+            self.assertEqual(
+                session.requests[1]["headers"]["Range"], "bytes=3-"
+            )
+            self.assertTrue(
+                any(message.startswith("RESUMING:") for message in logger.messages)
+            )
 
 
 if __name__ == "__main__":
