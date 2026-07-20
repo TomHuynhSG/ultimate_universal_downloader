@@ -164,7 +164,7 @@ const TaskCard = memo(function TaskCard({
             <span style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>#{number}</span>
             <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{task.title}</span>
           </h3>
-          <a href={task.url} target="_blank" rel="noreferrer" style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>
+          <a href={task.url} target="_blank" rel="noreferrer" style={{ display: 'block', maxWidth: '100%', color: 'var(--text-muted)', fontSize: '0.8rem' }}>
             {task.url}
           </a>
 
@@ -431,7 +431,7 @@ function App() {
             <button className="btn glass-panel danger" onClick={async () => { if (window.confirm('Clear task history? Downloaded files are kept.')) await postAction('/downloads/clear-all') }}><Trash2 size={14} /> Clear all</button>
           </div>
         </div>
-        <div style={{ display: 'grid', gap: '12px' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: '12px' }}>
           {visibleDownloads.length === 0 ? (
             <div className="glass-panel empty-state"><Search size={42} /><p>No tasks yet.</p></div>
           ) : visibleDownloads.map((task, index) => (
