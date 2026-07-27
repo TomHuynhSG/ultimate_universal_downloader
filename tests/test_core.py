@@ -12,13 +12,19 @@ from backend.api.router import (
     open_download_directory,
 )
 from backend.core.config import DEFAULT_SETTINGS
-from backend.core.downloader import DownloadManager
+from backend.core.downloader import DownloadManager, _assign_unique_filenames
 from backend.core.limits import ResizableLimiter
-from backend.core.paths import resolve_within, sanitize_component
+from backend.core.paths import (
+    MAX_FILENAME_LENGTH,
+    resolve_within,
+    sanitize_component,
+    unique_filename,
+)
 from backend.plugins.manager import PluginManager
 from backend.plugins.utils import bounded_map, resize_runtime_extraction_limit
 from plugins.hitomi import HitomiExtractor
 from plugins.luscious import LusciousExtractor
+from plugins.twitter import TwitterExtractor
 
 
 class DummyLogger:
@@ -120,6 +126,24 @@ class LusciousSession:
         return Response()
 
 
+class TwitterSession:
+    def __init__(self, payload):
+        self.payload = payload
+        self.urls = []
+
+    async def get(self, url, **kwargs):
+        self.urls.append(url)
+        payload = self.payload
+
+        class Response:
+            status_code = 200
+
+            def json(self):
+                return payload
+
+        return Response()
+
+
 class PathTests(unittest.TestCase):
     def test_default_download_directory_is_absolute(self):
         self.assertTrue(Path(DEFAULT_SETTINGS["download_dir"]).is_absolute())
@@ -131,6 +155,82 @@ class PathTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(ValueError):
                 resolve_within(directory, "..", "outside")
+
+    def test_unique_filename_keeps_counter_inside_budget(self):
+        long_name = f"{'a' * MAX_FILENAME_LENGTH}.mp4"
+        first = unique_filename(long_name, set())
+        second = unique_filename(first, {first.lower()})
+
+        self.assertNotEqual(first, second)
+        self.assertTrue(second.endswith("_2.mp4"))
+        self.assertLessEqual(len(second), MAX_FILENAME_LENGTH)
+
+    def test_unique_filename_comparison_is_case_insensitive(self):
+        self.assertEqual(unique_filename("Clip.mp4", {"clip.mp4"}), "Clip_2.mp4")
+
+
+class UniqueTargetTests(unittest.TestCase):
+    def test_truncated_names_are_separated_per_folder(self):
+        stem = "b" * MAX_FILENAME_LENGTH
+        items = [
+            {"url": "https://cdn.example.com/one.mp4", "filename": f"{stem}_1.mp4"},
+            {"url": "https://cdn.example.com/two.mp4", "filename": f"{stem}_2.mp4"},
+            {
+                "url": "https://cdn.example.com/three.mp4",
+                "filename": f"{stem}_3.mp4",
+                "folder": "Chapter 2",
+            },
+        ]
+
+        _assign_unique_filenames(items)
+        names = [item["filename"] for item in items]
+
+        # The first two share a folder and truncate to the same head, so the
+        # second must be renamed rather than overwrite the first.
+        self.assertEqual(len(set(names[:2])), 2)
+        # A different folder is a different destination, so it keeps the name.
+        self.assertEqual(names[0], names[2])
+        for name in names:
+            self.assertLessEqual(len(name), MAX_FILENAME_LENGTH)
+
+    def test_colliding_plain_urls_become_distinct_items(self):
+        items = ["https://a.example.com/clip.mp4", "https://b.example.com/clip.mp4"]
+
+        _assign_unique_filenames(items)
+
+        self.assertEqual(
+            items,
+            [
+                {"url": "https://a.example.com/clip.mp4", "filename": "clip.mp4"},
+                {"url": "https://b.example.com/clip.mp4", "filename": "clip_2.mp4"},
+            ],
+        )
+
+    def test_distinct_names_keep_their_own_destination(self):
+        items = [
+            {"url": "https://cdn.example.com/a.jpg"},
+            {"url": "https://cdn.example.com/b.jpg"},
+        ]
+
+        _assign_unique_filenames(items)
+
+        self.assertEqual(items[0]["filename"], "a.jpg")
+        self.assertEqual(items[1]["filename"], "b.jpg")
+
+    def test_hls_items_are_compared_by_their_converted_extension(self):
+        items = [
+            {
+                "url": "https://cdn.example.com/stream.m3u8",
+                "type": "hls",
+                "filename": "clip.m3u8",
+            },
+            {"url": "https://cdn.example.com/clip.mp4"},
+        ]
+
+        _assign_unique_filenames(items)
+
+        self.assertEqual(items[0]["filename"], "clip.mp4")
+        self.assertEqual(items[1]["filename"], "clip_2.mp4")
 
 
 class SettingsTests(unittest.TestCase):
@@ -208,6 +308,85 @@ class LusciousTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(media[0]["convert_to"], "gif")
         self.assertEqual(media[0]["fallback_url"], gif_url)
         self.assertEqual(session.head_urls, [gif_url, mp4_url])
+
+
+class TwitterTests(unittest.IsolatedAsyncioTestCase):
+    LONG_TEXT = (
+        "Collab with a student of HCMUE ... Vibe hiền lành dễ "
+        "thương mà cái vibe ấy kéo dài "
+        "thêm rất nhiều chữ nữa cho đủ dài"
+    )
+
+    def _payload(self, video_count, text=""):
+        return {
+            "user_screen_name": "tranvietanh0810",
+            "text": text,
+            "media_extended": [
+                {
+                    "type": "video",
+                    "url": f"https://video.twimg.com/amplify_video/{index}/vid.mp4",
+                    "thumbnail_url": f"https://pbs.twimg.com/{index}.jpg",
+                }
+                for index in range(video_count)
+            ],
+        }
+
+    async def test_every_video_of_a_post_keeps_its_own_file(self):
+        session = TwitterSession(self._payload(2, self.LONG_TEXT))
+        extractor = TwitterExtractor(
+            "https://x.com/tranvietanh0810/status/2070393711335489613"
+        )
+
+        media = await extractor.extract(session)
+        names = [item["filename"] for item in media]
+
+        self.assertEqual(len(media), 2)
+        for name in names:
+            self.assertLessEqual(len(name), MAX_FILENAME_LENGTH)
+        self.assertTrue(names[0].endswith(" - 2070393711335489613_1.mp4"))
+        self.assertTrue(names[1].endswith(" - 2070393711335489613_2.mp4"))
+
+        # The engine must not have to rename anything: the plugin already fits
+        # the filename budget without losing the per-video discriminator.
+        _assign_unique_filenames(media)
+        self.assertEqual([item["filename"] for item in media], names)
+
+    async def test_single_video_has_no_positional_suffix(self):
+        session = TwitterSession(self._payload(1, "short caption"))
+        extractor = TwitterExtractor(
+            "https://x.com/tranvietanh0810/status/2070393711335489613"
+        )
+
+        media = await extractor.extract(session)
+
+        self.assertEqual(
+            media[0]["filename"],
+            "tranvietanh0810 - short caption - 2070393711335489613.mp4",
+        )
+        self.assertEqual(extractor.title, "X.com - tranvietanh0810")
+
+    async def test_post_without_description_still_names_the_file(self):
+        session = TwitterSession(self._payload(1))
+        extractor = TwitterExtractor(
+            "https://x.com/tranvietanh0810/status/2070393711335489613"
+        )
+
+        media = await extractor.extract(session)
+
+        self.assertEqual(
+            media[0]["filename"],
+            "tranvietanh0810 - 2070393711335489613.mp4",
+        )
+
+    async def test_post_without_video_reports_a_clear_failure(self):
+        payload = self._payload(0)
+        payload["media_extended"] = [{"type": "image", "url": "https://x/y.jpg"}]
+        extractor = TwitterExtractor(
+            "https://x.com/tranvietanh0810/status/2070393711335489613"
+        )
+
+        with self.assertRaisesRegex(Exception, "No video or gif"):
+            await extractor.extract(TwitterSession(payload))
 
 
 class AsyncPipelineTests(unittest.IsolatedAsyncioTestCase):

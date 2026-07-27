@@ -23,6 +23,7 @@ from backend.core.paths import (
     sanitize_component,
     sanitize_filename,
     task_output_path,
+    unique_filename,
 )
 from backend.database.models import DownloadTask, SessionLocal
 from backend.plugins.manager import PluginManager
@@ -48,6 +49,46 @@ KNOWN_EXTENSIONS = {
 
 def _utcnow():
     return datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+
+
+def _item_filename(index, item):
+    """Resolve the on-disk filename the downloader will use for one media item."""
+    image_url = item if isinstance(item, str) else item.get("url") or ""
+    media_type = "" if isinstance(item, str) else item.get("type", "")
+    explicit_filename = None if isinstance(item, str) else item.get("filename")
+    url_path = urllib.parse.unquote(urllib.parse.urlparse(image_url).path)
+    url_name = Path(url_path).name
+    if explicit_filename:
+        filename = sanitize_filename(explicit_filename, fallback=f"{index + 1:03d}.bin")
+    elif Path(url_name).suffix.lower() in KNOWN_EXTENSIONS:
+        filename = sanitize_filename(url_name, fallback=f"{index + 1:03d}.bin")
+    else:
+        filename = f"{index + 1:03d}.jpg"
+    is_hls = media_type == "hls" or url_path.lower().endswith(".m3u8")
+    if is_hls and Path(filename).suffix.lower() != ".mp4":
+        filename = f"{Path(filename).stem}.mp4"
+    return filename
+
+
+def _assign_unique_filenames(items):
+    """Pin an explicit, collision-free filename on every item of one task.
+
+    Long titles are truncated to fit the filename budget, so unrelated items
+    can sanitize down to the same name. Without this pass they would share one
+    `.part` file, download over each other, and silently produce a single
+    output file for several distinct media URLs.
+    """
+    taken_by_folder = {}
+    for index, item in enumerate(items):
+        folder = "" if isinstance(item, str) else item.get("folder", "")
+        taken = taken_by_folder.setdefault(folder, set())
+        resolved = unique_filename(_item_filename(index, item), taken)
+        taken.add(resolved.lower())
+        if isinstance(item, str):
+            items[index] = {"url": item, "filename": resolved}
+        else:
+            item["filename"] = resolved
+    return items
 
 
 def _task_snapshot(task_id):
@@ -493,6 +534,7 @@ class DownloadManager:
                         item["folder"] = sanitize_component(
                             item["folder"], fallback="Media", max_length=175
                         )
+                _assign_unique_filenames(extracted_urls)
 
                 total = len(extracted_urls)
                 if total == 0:
@@ -733,18 +775,9 @@ class DownloadManager:
         media_type = "" if isinstance(item, str) else item.get("type", "")
         convert_to = "" if isinstance(item, str) else item.get("convert_to", "")
         fallback_url = None if isinstance(item, str) else item.get("fallback_url")
-        explicit_filename = None if isinstance(item, str) else item.get("filename")
         url_path = urllib.parse.unquote(urllib.parse.urlparse(image_url).path)
-        url_name = Path(url_path).name
-        if explicit_filename:
-            filename = sanitize_filename(explicit_filename, fallback=f"{index + 1:03d}.bin")
-        elif Path(url_name).suffix.lower() in KNOWN_EXTENSIONS:
-            filename = sanitize_filename(url_name, fallback=f"{index + 1:03d}.bin")
-        else:
-            filename = f"{index + 1:03d}.jpg"
+        filename = _item_filename(index, item)
         is_hls = media_type == "hls" or url_path.lower().endswith(".m3u8")
-        if is_hls and Path(filename).suffix.lower() != ".mp4":
-            filename = f"{Path(filename).stem}.mp4"
 
         target_directory = resolve_within(output_path, subfolder) if subfolder else Path(output_path)
         file_path = resolve_within(target_directory, filename)

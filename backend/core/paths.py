@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+MAX_FILENAME_LENGTH = 120
 WINDOWS_RESERVED_NAMES = {
     "CON",
     "PRN",
@@ -34,7 +35,12 @@ def sanitize_component(value: object, *, fallback: str, max_length: int = 175) -
     return component or fallback
 
 
-def sanitize_filename(value: object, *, fallback: str = "download.bin", max_length: int = 120) -> str:
+def sanitize_filename(
+    value: object,
+    *,
+    fallback: str = "download.bin",
+    max_length: int = MAX_FILENAME_LENGTH,
+) -> str:
     raw = sanitize_component(value, fallback=fallback, max_length=max_length * 2)
     suffix = Path(raw).suffix
     if len(raw) <= max_length:
@@ -43,6 +49,33 @@ def sanitize_filename(value: object, *, fallback: str = "download.bin", max_leng
     suffix = suffix[:16]
     stem_budget = max(1, max_length - len(suffix))
     return f"{Path(raw).stem[:stem_budget]}{suffix}"
+
+
+def unique_filename(
+    value: str, taken: set[str], *, max_length: int = MAX_FILENAME_LENGTH
+) -> str:
+    """Return *value*, or a numbered variant of it that is not already *taken*.
+
+    Names are compared case-insensitively because Windows paths are. The
+    counter is appended after truncating the stem, so two long names that
+    sanitize to the same head still resolve to distinct files instead of
+    sharing one destination.
+    """
+    if value.lower() not in taken:
+        return value
+
+    path = Path(value)
+    stem = path.stem
+    suffix = path.suffix[:16]
+    counter = 2
+    while True:
+        marker = f"_{counter}"
+        stem_budget = max(1, max_length - len(suffix) - len(marker))
+        head = stem[:stem_budget].rstrip() or "file"
+        candidate = f"{head}{marker}{suffix}"
+        if candidate.lower() not in taken:
+            return candidate
+        counter += 1
 
 
 def resolve_within(base: str | os.PathLike[str], *parts: str) -> Path:

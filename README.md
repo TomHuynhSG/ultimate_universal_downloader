@@ -118,6 +118,8 @@ Create one module in `plugins/` containing a `BaseExtractor` subclass. `URLS` en
 
 Prefer dictionaries because they preserve referers and grouping. Do not download media bytes inside the plugin—the core downloader handles streaming, retries, limits, cancellation, and atomic files.
 
+Filenames are capped at 120 characters. Sanitizing trims the **tail**, so keep anything that distinguishes one item from another—an index, an ID—short and let the descriptive part absorb the truncation; a name whose unique part is trimmed away would otherwise resolve to the same destination as its neighbour. The engine deduplicates identical destinations within a folder as a safety net (`file.mp4`, `file_2.mp4`), but a plugin that names its own files should not depend on it.
+
 ### Production template
 
 ```python

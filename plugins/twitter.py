@@ -1,12 +1,18 @@
 import re
+from pathlib import Path
+from urllib.parse import urlparse
+
+from backend.core.paths import MAX_FILENAME_LENGTH, sanitize_component
 from backend.plugins.base import BaseExtractor
+
+VIDEO_EXTENSIONS = {".mp4", ".gif", ".webm"}
 
 class TwitterExtractor(BaseExtractor):
     """
     Downloads videos from X / Twitter posts natively via api.vxtwitter.com
     Bypasses dynamic state tokens and aggressive rate limits.
     """
-    
+
     URLS = ["x.com", "twitter.com", "api.vxtwitter.com"]
 
     async def extract(self, session):
@@ -14,73 +20,69 @@ class TwitterExtractor(BaseExtractor):
         m = re.search(r'status/(\d+)', self.url)
         if not m:
             raise Exception("Invalid X/Twitter URL. Cannot find the status ID.")
-        
+
         tweet_id = m.group(1)
         api_url = f"https://api.vxtwitter.com/i/status/{tweet_id}"
-        
+
         print(f"Fetching X Post via vxtwitter API: {api_url}")
-        
+
         resp = await session.get(api_url)
         if resp.status_code != 200:
             raise Exception(f"Failed to fetch X post! HTTP {resp.status_code}")
-            
+
         data = resp.json()
-        
+
         user = data.get("user_screen_name", "UnknownUser")
-        text = data.get("text", "No Description")
-        
-        # Clean the text to be extremely safe for Windows file paths
-        # Replace newlines with spaces
-        safe_text = re.sub(r'[\r\n]+', ' ', text)
-        # Strip all invalid Windows filename characters
-        safe_text = re.sub(r'[\\/*?:"<>|]', "", safe_text)
-        
-        # Windows max path is 260 characters. We will conservatively limit the filename
-        # itself to 150 characters to ensure the root path + title + filename doesn't crash.
-        raw_title = f"{user} - {safe_text}"
-        if len(raw_title) > 130:
-            raw_title = raw_title[:127] + "..."
-            
-        # Append the unique tweet ID to prevent conflicts when posts have no description
-        raw_title = f"{raw_title} - {tweet_id}"
+        text = data.get("text", "")
+
+        # Collapse newlines to spaces, then let the shared sanitizer strip every
+        # character Windows rejects in a path component.
+        description = sanitize_component(
+            re.sub(r'[\r\n]+', ' ', text),
+            fallback="",
+            max_length=MAX_FILENAME_LENGTH * 4,
+        )
+
+        videos = [
+            media
+            for media in data.get("media_extended", [])
+            if media.get("type") in ("video", "gif")
+        ]
+        if not videos:
+            raise Exception("No video or gif found in this X post.")
+
         self.title = f"X.com - {user}"
         self.flat_directory = True
-        
-        # Look for thumbnail
-        media_array = data.get("media_extended", [])
-        if media_array:
-            self.thumbnail = media_array[0].get("thumbnail_url")
-            
+        self.thumbnail = videos[0].get("thumbnail_url")
+
         media_items = []
-        video_count = 1
-        
-        for media in media_array:
-            if media.get("type") in ["video", "gif"]:
-                video_url = media.get("url")
-                # Ensure we have an extension
-                ext = ".mp4"
-                if video_url.endswith(".mp4"):
-                    ext = ".mp4"
-                elif video_url.endswith(".gif"):
-                    ext = ".gif"
-                elif video_url.endswith(".webm"):
-                    ext = ".webm"
-                    
-                # Add suffix if there are multiple videos in the same post
-                suffix = f"_{video_count}" if len(media_array) > 1 else ""
-                video_count += 1
-                
-                filename = f"{raw_title.strip()}{suffix}{ext}"
-                
-                media_items.append({
-                    "url": video_url,
-                    "referer": "https://twitter.com/",
-                    "type": "video",
-                    "filename": filename
-                })
-                
-        # If no video was found, we will still raise an exception or let the pipeline mark it error
-        if not media_items:
-            raise Exception("No video or gif found in this X post.")
-            
+        for position, media in enumerate(videos, start=1):
+            video_url = media.get("url") or ""
+            extension = Path(urlparse(video_url).path).suffix.lower()
+            if extension not in VIDEO_EXTENSIONS:
+                extension = ".mp4"
+
+            # The tweet ID separates posts that have no description, and the
+            # position separates videos inside one post. Both must survive the
+            # engine's filename budget, so the description absorbs the
+            # truncation instead of the tail: a name trimmed from the right
+            # would leave every video of a post pointing at the same file.
+            tail = f" - {tweet_id}"
+            if len(videos) > 1:
+                tail += f"_{position}"
+            tail += extension
+
+            head = f"{user} - {description}" if description else user
+            budget = max(1, MAX_FILENAME_LENGTH - len(tail))
+            if len(head) > budget:
+                head = head[:budget]
+            head = head.strip().rstrip(". ") or user
+
+            media_items.append({
+                "url": video_url,
+                "referer": "https://twitter.com/",
+                "type": "video",
+                "filename": f"{head}{tail}",
+            })
+
         return media_items

@@ -4,7 +4,8 @@
       "Bash(git -C \"F:\\\\Skynet-Project\\\\ultimate_universal_downloader\" diff --stat plugins/hitomi.py)",
       "Bash(git *)",
       "Bash(curl -s \"https://ltn.gold-usergeneratedcontent.net/galleries/905232.js\")",
-      "Bash(python *)"
+      "Bash(python *)",
+      "Bash(PYTHONIOENCODING=utf-8 python *)"
     ]
   }
 }
