@@ -14,6 +14,7 @@ from backend.api.router import (
 from backend.core.config import DEFAULT_SETTINGS
 from backend.core.downloader import DownloadManager, _assign_unique_filenames
 from backend.core.limits import ResizableLimiter
+from backend.core.media import MediaProcessor
 from backend.core.paths import (
     MAX_FILENAME_LENGTH,
     resolve_within,
@@ -127,18 +128,23 @@ class LusciousSession:
 
 
 class TwitterSession:
-    def __init__(self, payload):
-        self.payload = payload
+    """Serves one canned response per mirror host and records the call order."""
+
+    def __init__(self, fx=None, vx=None):
+        self.responses = {"fxtwitter": fx, "vxtwitter": vx}
         self.urls = []
 
     async def get(self, url, **kwargs):
         self.urls.append(url)
-        payload = self.payload
+        host = "fxtwitter" if "fxtwitter" in url else "vxtwitter"
+        status, payload = self.responses.get(host) or (403, None)
 
         class Response:
-            status_code = 200
+            status_code = status
 
             def json(self):
+                if payload is None:
+                    raise ValueError("mirror returned a challenge page, not JSON")
                 return payload
 
         return Response()
@@ -317,22 +323,42 @@ class TwitterTests(unittest.IsolatedAsyncioTestCase):
         "thêm rất nhiều chữ nữa cho đủ dài"
     )
 
-    def _payload(self, video_count, text=""):
+    def _media(self, video_count):
+        return [
+            {
+                "type": "video",
+                "url": f"https://video.twimg.com/amplify_video/{index}/vid.mp4",
+                "thumbnail_url": f"https://pbs.twimg.com/{index}.jpg",
+            }
+            for index in range(video_count)
+        ]
+
+    def _payload(self, video_count, text="", facet_links=()):
+        """The nested FixTweet schema served by the primary mirror."""
+        tweet = {
+            "author": {"screen_name": "tranvietanh0810"},
+            "text": text,
+        }
+        if video_count:
+            tweet["media"] = {"all": self._media(video_count)}
+        if facet_links:
+            tweet["raw_text"] = {
+                "facets": [
+                    {"type": "url", "replacement": link} for link in facet_links
+                ]
+            }
+        return {"code": 200, "message": "OK", "tweet": tweet}
+
+    def _vx_payload(self, video_count, text=""):
+        """The flat schema served by the fallback mirror."""
         return {
             "user_screen_name": "tranvietanh0810",
             "text": text,
-            "media_extended": [
-                {
-                    "type": "video",
-                    "url": f"https://video.twimg.com/amplify_video/{index}/vid.mp4",
-                    "thumbnail_url": f"https://pbs.twimg.com/{index}.jpg",
-                }
-                for index in range(video_count)
-            ],
+            "media_extended": self._media(video_count),
         }
 
     async def test_every_video_of_a_post_keeps_its_own_file(self):
-        session = TwitterSession(self._payload(2, self.LONG_TEXT))
+        session = TwitterSession(fx=(200, self._payload(2, self.LONG_TEXT)))
         extractor = TwitterExtractor(
             "https://x.com/tranvietanh0810/status/2070393711335489613"
         )
@@ -352,7 +378,7 @@ class TwitterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["filename"] for item in media], names)
 
     async def test_single_video_has_no_positional_suffix(self):
-        session = TwitterSession(self._payload(1, "short caption"))
+        session = TwitterSession(fx=(200, self._payload(1, "short caption")))
         extractor = TwitterExtractor(
             "https://x.com/tranvietanh0810/status/2070393711335489613"
         )
@@ -366,7 +392,7 @@ class TwitterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(extractor.title, "X.com - tranvietanh0810")
 
     async def test_post_without_description_still_names_the_file(self):
-        session = TwitterSession(self._payload(1))
+        session = TwitterSession(fx=(200, self._payload(1)))
         extractor = TwitterExtractor(
             "https://x.com/tranvietanh0810/status/2070393711335489613"
         )
@@ -380,13 +406,195 @@ class TwitterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_post_without_video_reports_a_clear_failure(self):
         payload = self._payload(0)
-        payload["media_extended"] = [{"type": "image", "url": "https://x/y.jpg"}]
+        payload["tweet"]["media"] = {"all": [{"type": "image", "url": "https://x/y.jpg"}]}
         extractor = TwitterExtractor(
             "https://x.com/tranvietanh0810/status/2070393711335489613"
         )
 
-        with self.assertRaisesRegex(Exception, "No video or gif"):
-            await extractor.extract(TwitterSession(payload))
+        with self.assertRaisesRegex(Exception, "No video, gif, or broadcast"):
+            await extractor.extract(TwitterSession(fx=(200, payload)))
+
+    async def test_text_only_post_is_not_mistaken_for_a_mirror_outage(self):
+        # A post that merely links a broadcast carries no "media" key at all,
+        # which must read as an empty post rather than an unparseable payload.
+        extractor = TwitterExtractor(
+            "https://x.com/tranvietanh0810/status/2070393711335489613"
+        )
+        session = TwitterSession(fx=(200, self._payload(0)))
+
+        with self.assertRaisesRegex(Exception, "No video, gif, or broadcast"):
+            await extractor.extract(session)
+
+        self.assertEqual(len(session.urls), 1)
+
+    async def test_broadcast_link_is_downloaded_as_an_hls_item(self):
+        # A broadcast replay never appears in the media array; the only trace
+        # of it is the expanded /i/broadcasts/ link in the post body.
+        payload = self._payload(
+            0,
+            "Kèo SOme sớm CN",
+            facet_links=["https://x.com/i/broadcasts/1qxvveqnVMzxB"],
+        )
+        extractor = TwitterExtractor(
+            "https://x.com/tranvietanh0810/status/2070393711335489613"
+        )
+
+        media = await extractor.extract(TwitterSession(fx=(200, payload)))
+
+        self.assertEqual(len(media), 1)
+        self.assertEqual(media[0]["type"], "hls")
+        self.assertEqual(
+            media[0]["url"], "https://x.com/i/broadcasts/1qxvveqnVMzxB"
+        )
+        # yt-dlp writes an mp4, and the name must carry no positional suffix.
+        self.assertTrue(media[0]["filename"].endswith(" - 2070393711335489613.mp4"))
+
+    async def test_attached_video_wins_over_a_broadcast_link(self):
+        payload = self._payload(
+            1,
+            "short caption",
+            facet_links=["https://x.com/i/broadcasts/1qxvveqnVMzxB"],
+        )
+        extractor = TwitterExtractor(
+            "https://x.com/tranvietanh0810/status/2070393711335489613"
+        )
+
+        media = await extractor.extract(TwitterSession(fx=(200, payload)))
+
+        self.assertEqual(len(media), 1)
+        self.assertEqual(media[0]["type"], "video")
+        self.assertIn("video.twimg.com", media[0]["url"])
+
+    async def test_broadcast_link_in_flat_mirror_text_is_found(self):
+        payload = self._vx_payload(0, "watch https://x.com/i/broadcasts/1qxvveqnVMzxB")
+        extractor = TwitterExtractor(
+            "https://x.com/tranvietanh0810/status/2070393711335489613"
+        )
+
+        media = await extractor.extract(
+            TwitterSession(fx=(403, None), vx=(200, payload))
+        )
+
+        self.assertEqual(media[0]["type"], "hls")
+
+    async def test_blocked_primary_mirror_falls_back_to_the_second(self):
+        session = TwitterSession(
+            fx=(403, None), vx=(200, self._vx_payload(1, "short caption"))
+        )
+        extractor = TwitterExtractor(
+            "https://x.com/tranvietanh0810/status/2070393711335489613"
+        )
+
+        media = await extractor.extract(session)
+
+        self.assertEqual(
+            media[0]["filename"],
+            "tranvietanh0810 - short caption - 2070393711335489613.mp4",
+        )
+        self.assertEqual(len(session.urls), 2)
+        self.assertIn("fxtwitter", session.urls[0])
+        self.assertIn("vxtwitter", session.urls[1])
+
+    async def test_every_mirror_failing_names_each_reason(self):
+        session = TwitterSession(fx=(403, None), vx=(500, None))
+        extractor = TwitterExtractor(
+            "https://x.com/tranvietanh0810/status/2070393711335489613"
+        )
+
+        with self.assertRaises(Exception) as caught:
+            await extractor.extract(session)
+
+        message = str(caught.exception)
+        self.assertIn("fxtwitter: HTTP 403", message)
+        self.assertIn("vxtwitter: HTTP 500", message)
+
+
+class HlsFragmentTests(unittest.IsolatedAsyncioTestCase):
+    """An HLS replay is latency-bound, so fragment concurrency must be tunable."""
+
+    def _captured_options(self, fragment_concurrency=None):
+        captured = {}
+
+        class FakeYoutubeDL:
+            def __init__(self, options):
+                captured.update(options)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def download(self, urls):
+                captured["_urls"] = urls
+
+        with patch("backend.core.media.yt_dlp.YoutubeDL", FakeYoutubeDL):
+            if fragment_concurrency is None:
+                MediaProcessor.download_video("https://x/y.m3u8", "out.mp4")
+            else:
+                MediaProcessor.download_video(
+                    "https://x/y.m3u8", "out.mp4", None, fragment_concurrency
+                )
+        return captured
+
+    def test_fragment_concurrency_reaches_yt_dlp(self):
+        options = self._captured_options(8)
+
+        self.assertEqual(options["concurrent_fragment_downloads"], 8)
+
+    def test_fragment_concurrency_defaults_to_serial(self):
+        options = self._captured_options()
+
+        self.assertEqual(options["concurrent_fragment_downloads"], 1)
+
+    def test_fragment_concurrency_never_drops_below_one(self):
+        # A zero would stall the download outright rather than merely slow it.
+        options = self._captured_options(0)
+
+        self.assertEqual(options["concurrent_fragment_downloads"], 1)
+
+    async def test_hls_item_uses_the_per_host_limit_for_fragments(self):
+        manager = DownloadManager.__new__(DownloadManager)
+        manager.host_limit = 6
+        manager.host_semaphores = {}
+        manager.global_item_semaphore = ResizableLimiter(2)
+        manager.wait_until_runnable = lambda task_id: asyncio.sleep(0)
+        manager.is_task_cancelled = lambda task_id: False
+        manager.is_chapter_cancelled = lambda task_id, folder: False
+
+        recorded = {}
+
+        def fake_download_video(url, output_path, headers=None, fragment_concurrency=1):
+            recorded["fragment_concurrency"] = fragment_concurrency
+            Path(output_path).write_bytes(b"video")
+
+        item = {
+            "url": "https://x.com/i/broadcasts/1qxvveqnVMzxB",
+            "type": "hls",
+            "filename": "broadcast.mp4",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch(
+                "backend.core.downloader.MediaProcessor.download_video",
+                fake_download_video,
+            ):
+                status, size = await manager._download_item(
+                    None,
+                    "task",
+                    "https://x.com/u/status/1",
+                    directory,
+                    0,
+                    item,
+                    DummyLogger(),
+                )
+            written = Path(directory) / "broadcast.mp4"
+            self.assertTrue(written.is_file())
+
+        self.assertEqual(status, "success")
+        self.assertEqual(size, 5)
+        # The engine must hand yt-dlp the per-host budget, not leave it serial.
+        self.assertEqual(recorded["fragment_concurrency"], 6)
 
 
 class AsyncPipelineTests(unittest.IsolatedAsyncioTestCase):

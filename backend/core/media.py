@@ -66,7 +66,12 @@ class MediaProcessor:
             raise RuntimeError("FFmpeg produced an empty GIF")
 
     @staticmethod
-    def download_video(url, output_path, headers=None):
+    def download_video(url, output_path, headers=None, fragment_concurrency=1):
+        # An HLS replay arrives as thousands of small fragments fetched one
+        # round-trip at a time, so the transfer is latency-bound rather than
+        # bandwidth-bound: yt-dlp's default of one fragment at a time leaves
+        # most of the link idle. The caller sizes this from the per-host limit
+        # because every fragment targets the same CDN hostname.
         options = {
             "outtmpl": output_path,
             "format": "bestvideo+bestaudio/best",
@@ -75,6 +80,7 @@ class MediaProcessor:
             "no_warnings": True,
             "noplaylist": True,
             "overwrites": True,
+            "concurrent_fragment_downloads": max(1, int(fragment_concurrency)),
         }
         if headers:
             options["http_headers"] = headers

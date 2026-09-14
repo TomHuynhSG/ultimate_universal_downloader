@@ -817,6 +817,7 @@ class DownloadManager:
                             image_url,
                             str(part_path),
                             headers,
+                            self.host_limit,
                         )
                     if self.is_task_cancelled(task_id) or self.is_chapter_cancelled(task_id, folder_name):
                         await asyncio.to_thread(part_path.unlink, missing_ok=True)
