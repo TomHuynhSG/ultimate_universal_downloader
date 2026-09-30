@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
+  CheckCircle2,
   Clock,
   Download,
   FolderOpen,
@@ -17,6 +18,7 @@ import {
   Settings,
   Trash2,
   XCircle,
+  Zap,
 } from 'lucide-react'
 import './index.css'
 
@@ -116,6 +118,7 @@ const TaskCard = memo(function TaskCard({
   number,
   onPause,
   onResume,
+  onPrioritize,
   onRestart,
   onDelete,
   onOpen,
@@ -209,15 +212,32 @@ const TaskCard = memo(function TaskCard({
 
         <aside style={{ flexShrink: 0, textAlign: 'right' }}>
           <strong>{task.progress}%</strong>
-          <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>{task.status}</p>
+          <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>
+            {task.status}
+            {task.priority && <span style={{ color: '#f59e0b', marginLeft: '6px' }}><Zap size={12} /> priority</span>}
+          </p>
           {totals.total > 0 && <p><Image size={13} /> {totals.done} / {totals.total}</p>}
           {totals.failed > 0 && <p style={{ color: '#f87171' }}>{totals.failed} failed</p>}
           {totals.size > 0 && <p><HardDrive size={13} /> {formatBytes(totals.size)}</p>}
+          {task.status === 'downloading' && meta.downloaded_bytes > 0 && (
+            <p><Download size={13} /> {formatBytes(meta.downloaded_bytes)}{meta.speed_bps > 0 ? ` • ${formatBytes(meta.speed_bps)}/s` : ''}</p>
+          )}
           {task.status === 'downloading' && meta.eta_seconds !== undefined && <p style={{ color: '#10b981' }}><Clock size={13} /> {formatTime(meta.eta_seconds)}</p>}
           {FINISHED_STATUSES.has(task.status) && meta.total_time_seconds !== undefined && <p><Clock size={13} /> {formatTime(meta.total_time_seconds)}</p>}
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '7px', marginTop: '10px' }}>
             <button className="icon-button" onClick={() => onLogs(task.id, task.title)} title="Logs"><Info size={16} /></button>
             <button className="icon-button" onClick={() => onOpen(task.id)} title="Open folder"><FolderOpen size={16} /></button>
+            {ACTIVE_STATUSES.has(task.status) && (
+              <button
+                className="icon-button"
+                onClick={() => onPrioritize(task.id)}
+                disabled={task.priority}
+                title={task.priority ? 'Prioritized: other tasks wait for this one' : 'Prioritize: pause other tasks and download this first'}
+                style={task.priority ? { color: '#f59e0b' } : undefined}
+              >
+                <Zap size={16} />
+              </button>
+            )}
             {task.status === 'downloading' && <button className="icon-button" onClick={() => onPause(task.id)} title="Pause"><Pause size={16} /></button>}
             {task.status === 'paused' && <button className="icon-button" onClick={() => onResume(task.id)} title="Resume"><Play size={16} /></button>}
             {FINISHED_STATUSES.has(task.status) && <button className="icon-button" onClick={() => onRestart(task.id)} title="Restart"><RotateCw size={16} /></button>}
@@ -372,6 +392,7 @@ function App() {
   const postAction = useCallback((path) => apiFetch(path, { method: 'POST' }).catch((error) => window.alert(error.message)), [])
   const pause = useCallback((id) => postAction(`/downloads/${id}/pause`), [postAction])
   const resume = useCallback((id) => postAction(`/downloads/${id}/resume`), [postAction])
+  const prioritize = useCallback((id) => postAction(`/downloads/${id}/prioritize`), [postAction])
   const restart = useCallback((id) => postAction(`/downloads/${id}/restart`), [postAction])
   const openFolder = useCallback((id) => postAction(`/downloads/${id}/open`), [postAction])
 
@@ -428,6 +449,7 @@ function App() {
           <div style={{ display: 'flex', gap: '8px' }}>
             <button className="btn glass-panel" onClick={() => postAction('/downloads/pause-all')}><Pause size={14} /> Pause all</button>
             <button className="btn glass-panel" onClick={() => postAction('/downloads/resume-all')}><Play size={14} /> Resume all</button>
+            <button className="btn glass-panel" onClick={() => postAction('/downloads/clear-completed')}><CheckCircle2 size={14} /> Clear completed</button>
             <button className="btn glass-panel danger" onClick={async () => { if (window.confirm('Clear task history? Downloaded files are kept.')) await postAction('/downloads/clear-all') }}><Trash2 size={14} /> Clear all</button>
           </div>
         </div>
@@ -441,6 +463,7 @@ function App() {
               number={downloads.length - index}
               onPause={pause}
               onResume={resume}
+              onPrioritize={prioritize}
               onRestart={restart}
               onDelete={deleteTask}
               onOpen={openFolder}

@@ -877,5 +877,333 @@ class AsyncPipelineTests(unittest.IsolatedAsyncioTestCase):
             )
 
 
+class CurlLikeResponse:
+    """Mimics curl_cffi: leaving the stream awaits the background transfer."""
+
+    def __init__(self, status_code, headers, chunks, hang_after=False, on_chunk=None):
+        self.status_code = status_code
+        self.headers = headers
+        self.chunks = chunks
+        self.hang_after = hang_after
+        self.on_chunk = on_chunk
+        self.quit_now = asyncio.Event()
+        # Stands in for a transfer that only ends once curl gives up on it.
+        self.astream_task = asyncio.create_task(asyncio.Event().wait())
+
+    async def aiter_content(self, chunk_size=None):
+        for chunk in self.chunks:
+            yield chunk
+            if self.on_chunk:
+                self.on_chunk()
+        if self.hang_after:
+            await asyncio.Event().wait()
+        self.astream_task.cancel()
+        self.astream_task = None
+
+
+class CurlLikeSession:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.requests = []
+
+    @asynccontextmanager
+    async def stream(self, *args, **kwargs):
+        self.requests.append(kwargs)
+        response = next(self.responses)
+        try:
+            yield response
+        finally:
+            if response.astream_task is not None:
+                await response.astream_task
+
+
+class TransferWatchdogTests(unittest.IsolatedAsyncioTestCase):
+    def make_manager(self):
+        manager = DownloadManager()
+        manager.loop = asyncio.get_running_loop()
+        manager.global_item_semaphore = asyncio.Semaphore(2)
+        manager.host_limit = 2
+        manager.host_semaphores = {}
+        manager.task_events["test-task"] = asyncio.Event()
+        manager.task_events["test-task"].set()
+        manager.stall_timeout = 0.05
+        return manager
+
+    async def download(self, manager, session, directory, **kwargs):
+        return await asyncio.wait_for(
+            manager._download_item(
+                session,
+                "test-task",
+                "https://x.com/user/status/1",
+                Path(directory),
+                0,
+                {"url": "https://video.twimg.com/v.mp4", "filename": "v.mp4"},
+                self.logger,
+                **kwargs,
+            ),
+            timeout=5,
+        )
+
+    def setUp(self):
+        self.logger = DummyLogger()
+
+    async def test_silent_connection_is_dropped_and_resumed(self):
+        manager = self.make_manager()
+        session = CurlLikeSession(
+            [
+                CurlLikeResponse(
+                    200,
+                    {"content-type": "video/mp4", "content-length": "6"},
+                    [b"abc"],
+                    hang_after=True,
+                ),
+                CurlLikeResponse(
+                    206,
+                    {
+                        "content-type": "video/mp4",
+                        "content-length": "3",
+                        "content-range": "bytes 3-5/6",
+                    },
+                    [b"def"],
+                ),
+            ]
+        )
+        progress = []
+
+        with tempfile.TemporaryDirectory() as directory:
+            result, size = await self.download(
+                manager,
+                session,
+                directory,
+                on_progress=lambda received, expected: progress.append((received, expected)),
+            )
+            self.assertEqual((result, size), ("success", 6))
+            self.assertEqual((Path(directory) / "v.mp4").read_bytes(), b"abcdef")
+
+        self.assertEqual(session.requests[1]["headers"]["Range"], "bytes=3-")
+        self.assertEqual(progress, [(3, 6), (6, 6)])
+        self.assertTrue(any("stalled" in message for message in self.logger.messages))
+        # A stall that moved data forward must not use up a regular attempt.
+        self.assertFalse(any(message.startswith("WARN: no data") for message in self.logger.messages))
+
+    async def test_connection_that_never_delivers_fails_after_attempts(self):
+        manager = self.make_manager()
+        session = CurlLikeSession(
+            CurlLikeResponse(
+                200,
+                {"content-type": "video/mp4", "content-length": "6"},
+                [],
+                hang_after=True,
+            )
+            for _ in range(3)
+        )
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "backend.core.downloader.asyncio.sleep", new=_instant_sleep
+        ):
+            result, size = await self.download(manager, session, directory)
+            self.assertEqual((result, size), ("failed", 0))
+            self.assertFalse((Path(directory) / "v.mp4.part").exists())
+        self.assertEqual(len(session.requests), 3)
+
+    async def test_crawling_connection_is_replaced_without_losing_the_tail(self):
+        manager = self.make_manager()
+        manager.low_speed_window = 0
+        manager.low_speed_rate = 10**12
+        session = CurlLikeSession(
+            [
+                CurlLikeResponse(
+                    200,
+                    {"content-type": "video/mp4", "content-length": "6"},
+                    [b"abc", b"def"],
+                ),
+                # The crawl verdict must not fire after the final chunk, or the
+                # resume would request a range past the end of the file.
+                CurlLikeResponse(
+                    206,
+                    {
+                        "content-type": "video/mp4",
+                        "content-length": "3",
+                        "content-range": "bytes 3-5/6",
+                    },
+                    [b"def"],
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            result, size = await self.download(manager, session, directory)
+            self.assertEqual((result, size), ("success", 6))
+            self.assertEqual((Path(directory) / "v.mp4").read_bytes(), b"abcdef")
+        self.assertEqual(len(session.requests), 2)
+        self.assertEqual(session.requests[1]["headers"]["Range"], "bytes=3-")
+
+    async def test_pause_drops_connection_and_resumes_from_partial(self):
+        manager = self.make_manager()
+        manager.stall_timeout = 5
+        event = manager.task_events["test-task"]
+
+        async def resume_once_paused():
+            while not any(m.startswith("PAUSED:") for m in self.logger.messages):
+                await asyncio.sleep(0.01)
+            event.set()
+
+        def pause_then_resume():
+            # The silent connection is only noticed by the poll, not by a chunk.
+            event.clear()
+            self.resumer = asyncio.create_task(resume_once_paused())
+
+        session = CurlLikeSession(
+            [
+                CurlLikeResponse(
+                    200,
+                    {"content-type": "video/mp4", "content-length": "6"},
+                    [b"abc"],
+                    hang_after=True,
+                    on_chunk=pause_then_resume,
+                ),
+                CurlLikeResponse(
+                    206,
+                    {
+                        "content-type": "video/mp4",
+                        "content-length": "3",
+                        "content-range": "bytes 3-5/6",
+                    },
+                    [b"def"],
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            result, size = await self.download(manager, session, directory)
+            self.assertEqual((result, size), ("success", 6))
+            self.assertEqual((Path(directory) / "v.mp4").read_bytes(), b"abcdef")
+        self.assertEqual(session.requests[1]["headers"]["Range"], "bytes=3-")
+        self.assertTrue(any(message.startswith("PAUSED:") for message in self.logger.messages))
+
+
+async def _instant_sleep(_delay, result=None):
+    """Skip retry backoff so failure-path tests stay fast."""
+    return result
+
+
+class PriorityTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.statuses = {}
+        self.releases = {}
+        self.started = []
+        manager = DownloadManager()
+        manager.loop = asyncio.get_running_loop()
+        manager.task_semaphore = ResizableLimiter(1)
+        self.manager = manager
+
+        async def fake_process(task_id, _url):
+            self.started.append(task_id)
+            self.statuses[task_id] = "downloading"
+            manager.task_events.setdefault(task_id, asyncio.Event()).set()
+            await self.releases.setdefault(task_id, asyncio.Event()).wait()
+            self.statuses[task_id] = "completed"
+
+        def fake_snapshot(task_id):
+            if task_id not in self.statuses:
+                return None
+            return {"id": task_id, "url": f"https://x.com/{task_id}", "status": self.statuses[task_id]}
+
+        def fake_set_statuses(task_ids, status, only_from):
+            for task_id in task_ids:
+                if self.statuses.get(task_id) in only_from:
+                    self.statuses[task_id] = status
+
+        manager._process_single_task = fake_process
+        self.patches = [
+            patch("backend.core.downloader._task_snapshot", side_effect=fake_snapshot),
+            patch("backend.core.downloader._set_statuses", side_effect=fake_set_statuses),
+        ]
+        for active_patch in self.patches:
+            active_patch.start()
+        manager.dispatcher_task = asyncio.create_task(manager._dispatcher())
+
+    async def asyncTearDown(self):
+        for release in self.releases.values():
+            release.set()
+        await self.manager.stop()
+        for active_patch in self.patches:
+            active_patch.stop()
+
+    def enqueue(self, task_id):
+        self.statuses[task_id] = "pending"
+        self.manager._enqueue_item((task_id, f"https://x.com/{task_id}"))
+
+    async def settle(self):
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    async def test_prioritized_pending_task_starts_and_pauses_others(self):
+        self.enqueue("a")
+        self.enqueue("b")
+        self.enqueue("c")
+        await self.settle()
+        self.assertEqual(self.started, ["a"])
+
+        self.assertTrue(await self.manager.prioritize_task("c"))
+        await self.settle()
+        self.assertEqual(self.started, ["a", "c"])
+        self.assertTrue(self.manager.is_task_paused("a"))
+        self.assertEqual(self.statuses["a"], "paused")
+        self.assertEqual(self.manager.priority_task_id, "c")
+
+        # Finishing "a" frees its slot, but nothing new may start meanwhile.
+        self.releases.setdefault("a", asyncio.Event()).set()
+        await self.settle()
+        self.assertEqual(self.started, ["a", "c"])
+
+        self.releases.setdefault("c", asyncio.Event()).set()
+        await self.settle()
+        self.assertIsNone(self.manager.priority_task_id)
+        # "b" runs next, and the stale queue entry for "c" never re-runs it.
+        self.assertEqual(self.started, ["a", "c", "b"])
+        self.releases.setdefault("b", asyncio.Event()).set()
+        await self.settle()
+        self.assertEqual(self.started, ["a", "c", "b"])
+
+    async def test_tasks_paused_by_priority_resume_but_manual_pauses_stay(self):
+        self.manager.task_semaphore = ResizableLimiter(3)
+        self.enqueue("a")
+        self.enqueue("b")
+        await self.settle()
+        self.manager._set_task_paused("b", True)
+        self.statuses["b"] = "paused"
+
+        self.enqueue("c")
+        self.assertTrue(await self.manager.prioritize_task("c"))
+        await self.settle()
+        self.assertTrue(self.manager.is_task_paused("a"))
+
+        self.releases.setdefault("c", asyncio.Event()).set()
+        await self.settle()
+        self.assertFalse(self.manager.is_task_paused("a"))
+        self.assertEqual(self.statuses["a"], "downloading")
+        self.assertTrue(self.manager.is_task_paused("b"))
+        self.assertEqual(self.statuses["b"], "paused")
+
+    async def test_pausing_the_prioritized_task_releases_the_others(self):
+        self.enqueue("a")
+        await self.settle()
+        self.enqueue("c")
+        self.assertTrue(await self.manager.prioritize_task("c"))
+        await self.settle()
+        self.assertTrue(self.manager.is_task_paused("a"))
+
+        self.manager._set_task_paused("c", True)
+        await self.settle()
+        self.assertIsNone(self.manager.priority_task_id)
+        self.assertFalse(self.manager.is_task_paused("a"))
+
+    async def test_finished_task_cannot_be_prioritized(self):
+        self.statuses["done"] = "completed"
+        self.assertFalse(await self.manager.prioritize_task("done"))
+        self.assertIsNone(self.manager.priority_task_id)
+
+
 if __name__ == "__main__":
     unittest.main()

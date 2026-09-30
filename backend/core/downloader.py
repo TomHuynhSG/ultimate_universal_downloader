@@ -45,6 +45,109 @@ KNOWN_EXTENSIONS = {
     ".webp",
     ".zip",
 }
+# curl_cffi only aborts a streamed transfer below 1 byte/s, and X's video CDN
+# can leave a connection silent for minutes while a fresh one runs at full
+# speed. These bound how long one connection may idle or crawl before it is
+# dropped and the download resumes from the partial file on a new one.
+STALL_TIMEOUT_SECONDS = 20
+LOW_SPEED_WINDOW_SECONDS = 30
+LOW_SPEED_BYTES_PER_SECOND = 16 * 1024
+# Reconnects that moved data forward are free; a stalled connection that
+# delivered nothing counts as an ordinary failed attempt instead.
+MAX_FREE_RECONNECTS = 10
+
+
+class StalledTransfer(RuntimeError):
+    """A streamed download stopped making progress on its connection."""
+
+    def __init__(self, message, received):
+        super().__init__(message)
+        self.received = received
+
+
+class TransferInterrupted(RuntimeError):
+    """The owning task was paused or cancelled while a transfer was in flight."""
+
+
+def _abort_stream(response):
+    """Tear down a curl_cffi stream without waiting for its transfer to end.
+
+    Leaving `session.stream()` awaits the background transfer task, which on a
+    silent connection only returns once curl gives up on it. Cancelling that
+    task and detaching it releases the handle immediately instead.
+    """
+    quit_now = getattr(response, "quit_now", None)
+    if quit_now is not None:
+        quit_now.set()
+    stream_task = getattr(response, "astream_task", None)
+    if stream_task is not None and not stream_task.done():
+        response.astream_task = None
+        stream_task.cancel()
+
+
+@asynccontextmanager
+async def _open_stream(session, *args, **kwargs):
+    """`session.stream()` that never waits on a transfer abandoned mid-body."""
+    async with session.stream(*args, **kwargs) as response:
+        try:
+            yield response
+        finally:
+            _abort_stream(response)
+
+
+async def _watched_chunks(
+    response,
+    stall_timeout,
+    window_seconds,
+    min_rate,
+    interrupted=None,
+    poll_seconds=0.5,
+):
+    """Yield body chunks, raising StalledTransfer when the connection idles or crawls.
+
+    While waiting for data it also polls `interrupted`, so pausing or deleting
+    a task takes effect at once instead of after the stall timeout.
+    """
+    chunks = response.aiter_content()
+    received = 0
+    window_started = time.monotonic()
+    window_bytes = 0
+    too_slow = None
+    while True:
+        next_chunk = asyncio.ensure_future(anext(chunks))
+        try:
+            idle_started = time.monotonic()
+            while not next_chunk.done():
+                idle = time.monotonic() - idle_started
+                if idle >= stall_timeout:
+                    raise StalledTransfer(f"no data for {stall_timeout:g}s", received)
+                await asyncio.wait(
+                    {next_chunk}, timeout=min(poll_seconds, stall_timeout - idle)
+                )
+                if not next_chunk.done() and interrupted and interrupted():
+                    raise TransferInterrupted(f"after {received} bytes on this connection")
+        finally:
+            if not next_chunk.done():
+                next_chunk.cancel()
+        try:
+            chunk = next_chunk.result()
+        except StopAsyncIteration:
+            return
+        if too_slow:
+            # Only give up once more body is actually pending: a crawl that
+            # just delivered the final chunk must still complete, or the resume
+            # would ask for a range past the end of the file.
+            raise StalledTransfer(too_slow, received)
+        received += len(chunk)
+        window_bytes += len(chunk)
+        elapsed = time.monotonic() - window_started
+        if elapsed >= window_seconds:
+            if window_bytes / max(elapsed, 1e-9) < min_rate:
+                too_slow = f"below {min_rate / 1024:g} KiB/s for {elapsed:.0f}s"
+            else:
+                window_started = time.monotonic()
+                window_bytes = 0
+        yield chunk
 
 
 def _utcnow():
@@ -122,6 +225,24 @@ def _update_task(task_id, **fields):
         task.updated_at = _utcnow()
         db.commit()
         return task.status
+    finally:
+        db.close()
+
+
+def _set_statuses(task_ids, status, only_from):
+    """Move each listed task to `status` if it is currently in `only_from`."""
+    db = SessionLocal()
+    try:
+        tasks = (
+            db.query(DownloadTask)
+            .filter(DownloadTask.id.in_(list(task_ids)))
+            .filter(DownloadTask.status.in_(list(only_from)))
+            .all()
+        )
+        for task in tasks:
+            task.status = status
+            task.updated_at = _utcnow()
+        db.commit()
     finally:
         db.close()
 
@@ -225,6 +346,16 @@ class DownloadManager:
         self.task_semaphore = None
         self.host_semaphores = {}
         self.host_limit = 1
+        self.stall_timeout = STALL_TIMEOUT_SECONDS
+        self.low_speed_window = LOW_SPEED_WINDOW_SECONDS
+        self.low_speed_rate = LOW_SPEED_BYTES_PER_SECOND
+        # A prioritized task runs outside the task limit while the dispatcher
+        # holds every queued task back and the tasks it paused wait for it.
+        self.priority_task_id = None
+        self._priority_idle = asyncio.Event()
+        self._priority_idle.set()
+        self._priority_paused = set()
+        self._launched_out_of_band = set()
 
     async def start(self):
         if self.dispatcher_task and not self.dispatcher_task.done():
@@ -337,6 +468,87 @@ class DownloadManager:
             event.clear()
         else:
             event.set()
+        # A manual pause or resume overrides whatever prioritizing decided.
+        self._priority_paused.discard(task_id)
+        if paused and task_id == self.priority_task_id:
+            self._release_priority()
+
+    def is_task_paused(self, task_id):
+        event = self.task_events.get(task_id)
+        return event is not None and not event.is_set()
+
+    async def prioritize_task(self, task_id):
+        running_loop = asyncio.get_running_loop()
+        if self.loop and self.loop.is_running() and self.loop is not running_loop:
+            future = asyncio.run_coroutine_threadsafe(
+                self._prioritize_task_local(task_id), self.loop
+            )
+            return await asyncio.wrap_future(future)
+        return await self._prioritize_task_local(task_id)
+
+    async def _prioritize_task_local(self, task_id):
+        snapshot = await asyncio.to_thread(_task_snapshot, task_id)
+        if not snapshot or snapshot["status"] not in {
+            "pending",
+            "extracting",
+            "downloading",
+            "paused",
+        }:
+            return False
+
+        self.priority_task_id = task_id
+        self._priority_idle.clear()
+        self._priority_paused.discard(task_id)
+
+        # Only runnable tasks are recorded, so a task the user paused by hand
+        # stays paused once the prioritized task finishes.
+        paused_now = []
+        for other_id in list(self.task_handles):
+            if other_id == task_id or self.is_task_paused(other_id):
+                continue
+            self.task_events.setdefault(other_id, asyncio.Event()).clear()
+            self._priority_paused.add(other_id)
+            paused_now.append(other_id)
+        if paused_now:
+            await asyncio.to_thread(
+                _set_statuses, paused_now, "paused", only_from={"downloading"}
+            )
+
+        if task_id in self.task_handles:
+            self.task_events.setdefault(task_id, asyncio.Event()).set()
+            await asyncio.to_thread(
+                _set_statuses, [task_id], "downloading", only_from={"paused"}
+            )
+        else:
+            # Pending or paused-before-start: it is either waiting in the
+            # queue or not queued at all, so start it directly and let the
+            # dispatcher drop its queue entry when it reaches it.
+            self._forget_task(task_id)
+            await asyncio.to_thread(
+                _set_statuses, [task_id], "pending", only_from={"paused"}
+            )
+            if snapshot["status"] == "pending":
+                self._launched_out_of_band.add(task_id)
+            self._launch(task_id, snapshot["url"], holds_slot=False)
+        return True
+
+    def _release_priority(self):
+        self.priority_task_id = None
+        self._priority_idle.set()
+        resumed = list(self._priority_paused)
+        self._priority_paused.clear()
+        for other_id in resumed:
+            event = self.task_events.get(other_id)
+            if event is not None:
+                event.set()
+        if resumed:
+            task = asyncio.create_task(
+                asyncio.to_thread(
+                    _set_statuses, resumed, "downloading", only_from={"paused"}
+                )
+            )
+            self.running_tasks.add(task)
+            task.add_done_callback(self.running_tasks.discard)
 
     def cancel_task(self, task_id):
         self._schedule_control(self._cancel_task, task_id)
@@ -423,27 +635,50 @@ class DownloadManager:
         print("Download dispatcher started.")
         while True:
             task_id, url = await self.queue.get()
-            await self.task_semaphore.acquire()
-            task = asyncio.create_task(self._run_queued_task(task_id, url))
-            self.running_tasks.add(task)
-            self.task_handles[task_id] = task
-            task.add_done_callback(
-                lambda completed, current_id=task_id: self._task_finished(
-                    current_id, completed
-                )
+            if task_id in self._launched_out_of_band or task_id in self.task_handles:
+                # Already started by prioritizing, or still running.
+                self._launched_out_of_band.discard(task_id)
+                self.queue.task_done()
+                continue
+            while True:
+                await self._priority_idle.wait()
+                await self.task_semaphore.acquire()
+                if self._priority_idle.is_set():
+                    break
+                # A task was prioritized while this one waited for a slot.
+                await self.task_semaphore.release()
+            if task_id in self._launched_out_of_band or task_id in self.task_handles:
+                self._launched_out_of_band.discard(task_id)
+                await self.task_semaphore.release()
+                self.queue.task_done()
+                continue
+            self._launch(task_id, url, holds_slot=True)
+
+    def _launch(self, task_id, url, holds_slot):
+        task = asyncio.create_task(self._run_queued_task(task_id, url, holds_slot))
+        self.running_tasks.add(task)
+        self.task_handles[task_id] = task
+        task.add_done_callback(
+            lambda completed, current_id=task_id: self._task_finished(
+                current_id, completed
             )
+        )
 
     def _task_finished(self, task_id, task):
         self.running_tasks.discard(task)
         if self.task_handles.get(task_id) is task:
             self.task_handles.pop(task_id, None)
+        self._priority_paused.discard(task_id)
+        if task_id == self.priority_task_id:
+            self._release_priority()
 
-    async def _run_queued_task(self, task_id, url):
+    async def _run_queued_task(self, task_id, url, holds_slot=True):
         try:
             await self._process_single_task(task_id, url)
         finally:
-            await self.task_semaphore.release()
-            self.queue.task_done()
+            if holds_slot:
+                await self.task_semaphore.release()
+                self.queue.task_done()
 
     async def _process_single_task(self, task_id, url):
         logger = TaskLogger(task_id)
@@ -566,7 +801,8 @@ class DownloadManager:
                 await asyncio.to_thread(
                     _update_task,
                     task_id,
-                    status="downloading",
+                    # Another task may have been prioritized during extraction.
+                    status="paused" if self.is_task_paused(task_id) else "downloading",
                     title=extractor.title,
                     thumbnail=getattr(extractor, "thumbnail", None),
                     output_path=str(output_path),
@@ -590,13 +826,28 @@ class DownloadManager:
                     "failed": 0,
                     "successful": 0,
                     "size_bytes": 0,
+                    "transferred": 0,
                 }
+                # Bytes received so far for each item still downloading, so a
+                # task holding one large video reports progress before it ends.
+                in_flight = {}
                 download_started = time.monotonic()
                 finished = asyncio.Event()
                 work_queue = asyncio.Queue(maxsize=max(2, worker_count * 2))
 
-                async def record_result(folder_name, result, file_size):
+                def byte_reporter(index):
+                    def report(received, expected):
+                        previous = in_flight.get(index, (0, None))[0]
+                        # A resumed connection restarts from the partial size,
+                        # so only forward movement counts as transferred.
+                        state["transferred"] += max(0, received - previous)
+                        in_flight[index] = (received, expected)
+
+                    return report
+
+                async def record_result(index, folder_name, result, file_size):
                     async with state_lock:
+                        in_flight.pop(index, None)
                         state["processed"] += 1
                         if result in {"success", "skipped"}:
                             state["successful"] += 1
@@ -636,15 +887,19 @@ class DownloadManager:
                                         index,
                                         item,
                                         logger,
+                                        on_progress=byte_reporter(index),
                                     )
                             except Exception as exc:
                                 logger.log(f"ERROR: Worker failed for item {index + 1}: {exc}")
                                 result, file_size = "failed", 0
-                            await record_result(folder_name, result, file_size)
+                            await record_result(index, folder_name, result, file_size)
                         finally:
                             work_queue.task_done()
 
                 async def progress_updater():
+                    speed = 0.0
+                    last_transferred = 0
+                    last_tick = time.monotonic()
                     while not finished.is_set():
                         await asyncio.sleep(0.5)
                         cancelled_now = self.get_cancelled_chapters(task_id)
@@ -652,18 +907,35 @@ class DownloadManager:
                             for chapter in cancelled_now:
                                 progress_details.pop(chapter, None)
                             progress_details["_cancelled"] = sorted(cancelled_now)
-                            elapsed = time.monotonic() - download_started
-                            rate = state["processed"] / elapsed if elapsed else 0
-                            remaining = max(0, total - state["processed"])
+                            now = time.monotonic()
+                            elapsed = now - download_started
+                            # Items still in flight count by the fraction of
+                            # their bytes received, when the size is known.
+                            partial = sum(
+                                min(1.0, received / expected)
+                                for received, expected in in_flight.values()
+                                if expected
+                            )
+                            units = state["processed"] + partial
+                            rate = units / elapsed if elapsed else 0
+                            remaining = max(0.0, total - units)
+                            tick = now - last_tick
+                            if tick > 0:
+                                sample = (state["transferred"] - last_transferred) / tick
+                                speed = sample if not speed else 0.7 * speed + 0.3 * sample
+                            last_transferred = state["transferred"]
+                            last_tick = now
                             progress_details["_meta"] = {
                                 "phase": "downloading",
                                 "eta_seconds": int(remaining / rate) if rate else 0,
                                 "elapsed_seconds": int(elapsed),
                                 "extraction_seconds": int(extraction_seconds),
                                 "failed_items": state["failed"],
+                                "downloaded_bytes": state["transferred"],
+                                "speed_bps": int(speed),
                             }
                             details_json = json.dumps(progress_details)
-                            progress = float(int((state["processed"] / total) * 100))
+                            progress = float(int((units / total) * 100))
                         status = await asyncio.to_thread(
                             _update_task,
                             task_id,
@@ -757,6 +1029,7 @@ class DownloadManager:
         index,
         item,
         logger,
+        on_progress=None,
     ):
         await self.wait_until_runnable(task_id)
         if self.is_task_cancelled(task_id):
@@ -803,7 +1076,9 @@ class DownloadManager:
             # by an older run may refer to different content at the same URL.
             await asyncio.to_thread(part_path.unlink, missing_ok=True)
 
-        for attempt in range(3):
+        attempt = 0
+        free_reconnects = 0
+        while attempt < 3:
             if self.is_task_cancelled(task_id) or self.is_chapter_cancelled(
                 task_id, folder_name
             ):
@@ -829,14 +1104,17 @@ class DownloadManager:
 
                 request_headers = dict(headers)
                 resume_from = 0
-                if attempt and await asyncio.to_thread(part_path.is_file):
+                # Any partial file here was written by an earlier connection of
+                # this call, since a stale one was removed before the loop.
+                if await asyncio.to_thread(part_path.is_file):
                     partial_stat = await asyncio.to_thread(part_path.stat)
                     resume_from = partial_stat.st_size
                     if resume_from:
                         request_headers["Range"] = f"bytes={resume_from}-"
 
                 async with self.download_slot(image_url):
-                    async with session.stream(
+                    async with _open_stream(
+                        session,
                         "GET",
                         image_url,
                         headers=request_headers,
@@ -888,14 +1166,31 @@ class DownloadManager:
                         expected_size = (int(expected) if expected and expected.isdigit() and not response.headers.get("content-encoding") else None)
                         response_written = 0
                         cancelled_during_transfer = False
+                        expected_total = (
+                            initial_size + expected_size if expected_size is not None else None
+                        )
                         async with aiofiles.open(part_path, write_mode) as handle:
-                            async for chunk in response.aiter_content(chunk_size=256 * 1024):
+                            async for chunk in _watched_chunks(
+                                response,
+                                self.stall_timeout,
+                                self.low_speed_window,
+                                self.low_speed_rate,
+                                interrupted=lambda: self.is_task_paused(task_id)
+                                or self.is_task_cancelled(task_id)
+                                or self.is_chapter_cancelled(task_id, folder_name),
+                            ):
                                 if self.is_task_cancelled(task_id) or self.is_chapter_cancelled(task_id, folder_name):
                                     cancelled_during_transfer = True
                                     break
                                 if chunk:
                                     await handle.write(chunk)
                                     response_written += len(chunk)
+                                    if on_progress:
+                                        on_progress(initial_size + response_written, expected_total)
+                                if self.is_task_paused(task_id):
+                                    raise TransferInterrupted(
+                                        f"paused at {initial_size + response_written} bytes"
+                                    )
                         if cancelled_during_transfer:
                             await asyncio.to_thread(part_path.unlink, missing_ok=True)
                             return "cancelled", 0
@@ -965,6 +1260,7 @@ class DownloadManager:
                                 index,
                                 fallback_item,
                                 logger,
+                                on_progress=on_progress,
                             )
                         raise RuntimeError(
                             f"Media conversion failed: {conversion_error}"
@@ -973,24 +1269,55 @@ class DownloadManager:
                 await asyncio.to_thread(os.replace, part_path, file_path)
                 logger.log(f"SUCCESS: Downloaded {filename} ({written} bytes)")
                 return "success", written
-            except Exception as exc:
-                if (
-                    is_hls or attempt >= 2
-                ) and await asyncio.to_thread(part_path.exists):
-                    await asyncio.to_thread(part_path.unlink, missing_ok=True)
-                message = str(exc)
-                delay = 2**attempt
-                if message.startswith("retry:"):
-                    _, raw_delay, message = message.split(":", 2)
-                    try:
-                        delay = min(float(raw_delay), 30)
-                    except ValueError:
-                        pass
-                if attempt < 2:
+            except TransferInterrupted as exc:
+                # Drop the connection so a paused task stops using bandwidth,
+                # then pick the partial file up again with a range request. A
+                # cancellation is handled by the check at the top of the loop.
+                if not (
+                    self.is_task_cancelled(task_id)
+                    or self.is_chapter_cancelled(task_id, folder_name)
+                ):
+                    logger.log(f"PAUSED: {filename} {exc}")
+                    await self.wait_until_runnable(task_id)
+                continue
+            except StalledTransfer as exc:
+                if exc.received and free_reconnects < MAX_FREE_RECONNECTS:
+                    free_reconnects += 1
                     logger.log(
-                        f"WARN: {message}. Retrying {filename} in {delay:.1f}s..."
+                        f"WARN: {filename} stalled ({exc}). Reconnecting to resume "
+                        f"({free_reconnects}/{MAX_FREE_RECONNECTS})..."
                     )
-                    await asyncio.sleep(delay)
-                else:
-                    logger.log(f"ERROR: Failed to download {image_url}: {message}")
+                    continue
+                attempt = await self._handle_failed_attempt(
+                    exc, attempt, is_hls, part_path, filename, image_url, logger
+                )
+            except Exception as exc:
+                attempt = await self._handle_failed_attempt(
+                    exc, attempt, is_hls, part_path, filename, image_url, logger
+                )
         return "failed", 0
+
+    async def _handle_failed_attempt(
+        self, exc, attempt, is_hls, part_path, filename, image_url, logger
+    ):
+        """Log a failed attempt, back off before the next one, and return its number."""
+        if (
+            is_hls or attempt >= 2
+        ) and await asyncio.to_thread(part_path.exists):
+            await asyncio.to_thread(part_path.unlink, missing_ok=True)
+        message = str(exc)
+        delay = 2**attempt
+        if message.startswith("retry:"):
+            _, raw_delay, message = message.split(":", 2)
+            try:
+                delay = min(float(raw_delay), 30)
+            except ValueError:
+                pass
+        if attempt < 2:
+            logger.log(
+                f"WARN: {message}. Retrying {filename} in {delay:.1f}s..."
+            )
+            await asyncio.sleep(delay)
+        else:
+            logger.log(f"ERROR: Failed to download {image_url}: {message}")
+        return attempt + 1

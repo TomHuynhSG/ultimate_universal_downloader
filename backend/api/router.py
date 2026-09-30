@@ -64,6 +64,7 @@ def _serialize_task(task):
         "details": _parse_details(task.details),
         "created_at": task.created_at,
         "updated_at": task.updated_at,
+        "priority": task.id == DownloadManager.get_instance().priority_task_id,
     }
 
 
@@ -203,6 +204,7 @@ class DownloadResponse(BaseModel):
     details: Dict[str, Any] = Field(default_factory=dict)
     created_at: datetime.datetime
     updated_at: Optional[datetime.datetime] = None
+    priority: bool = False
 
 
 @router.post("/downloads", response_model=DownloadResponse)
@@ -268,6 +270,14 @@ def resume_task(task_id: str, db: Session = Depends(get_db)):
     return {"status": "ok"}
 
 
+@router.post("/downloads/{task_id}/prioritize")
+async def prioritize_task(task_id: str):
+    prioritized = await DownloadManager.get_instance().prioritize_task(task_id)
+    if not prioritized:
+        raise HTTPException(status_code=409, detail="Only an active task can be prioritized")
+    return {"status": "ok"}
+
+
 @router.post("/downloads/{task_id}/restart")
 def restart_task(task_id: str, db: Session = Depends(get_db)):
     task = db.query(DownloadTask).filter(DownloadTask.id == task_id).first()
@@ -326,6 +336,31 @@ def clear_all_tasks(db: Session = Depends(get_db)):
             except OSError:
                 pass
     return {"status": "ok"}
+
+
+@router.post("/downloads/clear-completed")
+def clear_completed_tasks(db: Session = Depends(get_db)):
+    # Only "completed" tasks finished cleanly; "completed_with_errors",
+    # "error" and "failed" are kept so the user can inspect or restart them.
+    task_ids = [
+        task_id
+        for (task_id,) in db.query(DownloadTask.id)
+        .filter(DownloadTask.status == "completed")
+        .all()
+    ]
+    if task_ids:
+        db.query(DownloadTask).filter(DownloadTask.id.in_(task_ids)).delete(
+            synchronize_session=False
+        )
+        db.commit()
+
+    logs_dir = PROJECT_ROOT / "task_logs"
+    for task_id in task_ids:
+        try:
+            (logs_dir / f"{task_id}.log").unlink(missing_ok=True)
+        except OSError:
+            pass
+    return {"status": "ok", "cleared": len(task_ids)}
 
 
 @router.get("/downloads/{task_id}/logs")
