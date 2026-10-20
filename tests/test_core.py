@@ -1,4 +1,5 @@
 import asyncio
+import json
 import shutil
 import tempfile
 import unittest
@@ -1204,6 +1205,161 @@ class PriorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.manager.prioritize_task("done"))
         self.assertIsNone(self.manager.priority_task_id)
 
+
+class AutoRetryExtractor:
+    title = "Auto Retry Album"
+
+    def __init__(self, calls):
+        self.calls = calls
+
+    async def extract(self, _session):
+        self.calls.append("extract")
+        return ["https://cdn.example/001.jpg", "https://cdn.example/002.jpg"]
+
+
+class AutoRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="uud-auto-retry-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.task_id = "auto-retry"
+        self.url = "https://example.com/album"
+        self.row = {
+            "id": self.task_id,
+            "url": self.url,
+            "title": None,
+            "thumbnail": None,
+            "status": "pending",
+            "progress": 0.0,
+            "details": "{}",
+            "output_path": None,
+        }
+        self.calls = []
+        # Results for item 2, one per pass; the last one repeats.
+        self.second_item_results = ["success"]
+        manager = DownloadManager()
+        manager.loop = asyncio.get_running_loop()
+        manager.task_semaphore = ResizableLimiter(1)
+        manager.global_item_semaphore = ResizableLimiter(4)
+        manager.plugin_manager.get_extractor = (
+            lambda _url, progress_callback=None: AutoRetryExtractor(self.calls)
+        )
+        self.manager = manager
+
+        async def fake_download_item(
+            _session, _task_id, _url, _output, index, _item, _logger, on_progress=None
+        ):
+            if index == 0:
+                return "success", 10
+            passes = self.calls.count("extract")
+            results = self.second_item_results
+            result = results[min(passes, len(results)) - 1]
+            return result, 10 if result == "success" else 0
+
+        manager._download_item = fake_download_item
+
+        def fake_update(task_id, **fields):
+            if task_id != self.task_id:
+                return None
+            self.row.update(fields)
+            return self.row["status"]
+
+        @asynccontextmanager
+        async def fake_session(**_kwargs):
+            yield object()
+
+        class QuietLogger(DummyLogger):
+            def __init__(self, _task_id):
+                super().__init__()
+
+            async def start(self):
+                pass
+
+            async def close(self):
+                pass
+
+        self.patches = [
+            patch(
+                "backend.core.downloader._task_snapshot",
+                side_effect=lambda task_id: dict(self.row)
+                if task_id == self.task_id
+                else None,
+            ),
+            patch("backend.core.downloader._update_task", side_effect=fake_update),
+            patch(
+                "backend.core.downloader.get_settings",
+                return_value={**DEFAULT_SETTINGS, "download_dir": str(self.root)},
+            ),
+            patch("backend.core.downloader.AsyncSession", fake_session),
+            patch("backend.core.downloader.TaskLogger", QuietLogger),
+        ]
+        for active_patch in self.patches:
+            active_patch.start()
+        manager.dispatcher_task = asyncio.create_task(manager._dispatcher())
+
+    async def asyncTearDown(self):
+        await self.manager.stop()
+        for active_patch in self.patches:
+            active_patch.stop()
+
+    async def run_to_completion(self):
+        self.manager._enqueue_item((self.task_id, self.url))
+        await asyncio.wait_for(self.manager.queue.join(), timeout=10)
+
+    def details(self):
+        return json.loads(self.row["details"])
+
+    async def test_task_with_failed_items_is_retried_and_can_recover(self):
+        self.second_item_results = ["failed", "success"]
+
+        await self.run_to_completion()
+
+        self.assertEqual(self.calls, ["extract", "extract"])
+        self.assertEqual(self.row["status"], "completed")
+        self.assertEqual(self.details()["Media"]["failed"], 0)
+        self.assertEqual(self.details()["_auto_retries"], 1)
+
+    async def test_task_can_recover_on_its_second_retry(self):
+        self.second_item_results = ["failed", "failed", "success"]
+
+        await self.run_to_completion()
+
+        self.assertEqual(self.calls, ["extract"] * 3)
+        self.assertEqual(self.row["status"], "completed")
+        self.assertEqual(self.details()["_auto_retries"], 2)
+
+    async def test_task_that_keeps_failing_gives_up_after_two_retries(self):
+        self.second_item_results = ["failed"]
+
+        await self.run_to_completion()
+
+        self.assertEqual(self.calls, ["extract"] * 3)
+        self.assertEqual(self.row["status"], "completed_with_errors")
+        self.assertEqual(self.details()["Media"]["failed"], 1)
+        self.assertEqual(self.details()["_auto_retries"], 2)
+
+    async def test_retry_runs_before_tasks_already_queued(self):
+        self.second_item_results = ["failed", "success"]
+        started = []
+        process = self.manager._process_single_task
+
+        async def recording_process(task_id, url):
+            started.append(task_id)
+            return await process(task_id, url)
+
+        self.manager._process_single_task = recording_process
+        self.manager._enqueue_item((self.task_id, self.url))
+        self.manager._enqueue_item(("queued-next", "https://example.com/other"))
+        await asyncio.wait_for(self.manager.queue.join(), timeout=10)
+
+        self.assertEqual(started, [self.task_id, self.task_id, "queued-next"])
+        self.assertEqual(self.row["status"], "completed")
+
+    async def test_clean_task_is_not_retried(self):
+        await self.run_to_completion()
+
+        self.assertEqual(self.calls, ["extract"])
+        self.assertEqual(self.row["status"], "completed")
+        self.assertEqual(self.details()["_auto_retries"], 0)
 
 if __name__ == "__main__":
     unittest.main()

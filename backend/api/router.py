@@ -29,6 +29,7 @@ from backend.database.models import DownloadTask, SessionLocal
 router = APIRouter()
 ACTIVE_STATUSES = {"pending", "extracting", "downloading", "paused"}
 FINISHED_STATUSES = {"completed", "completed_with_errors", "error", "failed"}
+FAILED_STATUSES = FINISHED_STATUSES - {"completed"}
 LOG_ID_PATTERN = re.compile(r"[A-Fa-f0-9-]{8,36}")
 PROXY_CACHE_MAX_ITEMS = 128
 PROXY_CACHE_TTL_SECONDS = 3600
@@ -278,18 +279,39 @@ async def prioritize_task(task_id: str):
     return {"status": "ok"}
 
 
+def _reset_for_restart(task):
+    # Fresh details also reset the automatic retry count.
+    cancelled = _parse_details(task.details).get("_cancelled", [])
+    task.status = "pending"
+    task.progress = 0.0
+    task.details = json.dumps({"_cancelled": cancelled})
+
+
 @router.post("/downloads/{task_id}/restart")
 def restart_task(task_id: str, db: Session = Depends(get_db)):
     task = db.query(DownloadTask).filter(DownloadTask.id == task_id).first()
     if task and task.status in FINISHED_STATUSES:
-        details = _parse_details(task.details)
-        cancelled = details.get("_cancelled", [])
-        task.status = "pending"
-        task.progress = 0.0
-        task.details = json.dumps({"_cancelled": cancelled})
+        _reset_for_restart(task)
         db.commit()
         DownloadManager.get_instance().enqueue(task.id, task.url)
     return {"status": "ok"}
+
+
+@router.post("/downloads/retry-failed")
+def retry_failed_tasks(db: Session = Depends(get_db)):
+    tasks = (
+        db.query(DownloadTask)
+        .filter(DownloadTask.status.in_(FAILED_STATUSES))
+        .order_by(DownloadTask.created_at)
+        .all()
+    )
+    for task in tasks:
+        _reset_for_restart(task)
+    db.commit()
+    manager = DownloadManager.get_instance()
+    for task in tasks:
+        manager.enqueue(task.id, task.url)
+    return {"status": "ok", "retried": len(tasks)}
 
 
 @router.post("/downloads/pause-all")

@@ -31,6 +31,7 @@ from backend.plugins.utils import resize_runtime_extraction_limit
 
 
 RETRYABLE_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+MAX_AUTO_RETRIES = 2
 KNOWN_EXTENSIONS = {
     ".avif",
     ".gif",
@@ -674,7 +675,14 @@ class DownloadManager:
 
     async def _run_queued_task(self, task_id, url, holds_slot=True):
         try:
-            await self._process_single_task(task_id, url)
+            # The pipeline asks for an automatic retry by returning True. The
+            # retry runs here while the task still holds its slot, so it starts
+            # right away instead of behind everything waiting in the queue.
+            while await self._process_single_task(task_id, url):
+                if task_id != self.priority_task_id:
+                    # Like a queued task, hold back while another one is
+                    # prioritized.
+                    await self._priority_idle.wait()
         finally:
             if holds_slot:
                 await self.task_semaphore.release()
@@ -701,6 +709,12 @@ class DownloadManager:
                 existing_details = {}
             cancelled = existing_details.get("_cancelled", [])
             self.load_cancelled_chapters(task_id, cancelled)
+            # Counts the automatic retries this task has used; a manual
+            # restart resets the details and with them this count.
+            try:
+                auto_retries = int(existing_details.get("_auto_retries", 0))
+            except (TypeError, ValueError):
+                auto_retries = 0
 
             event = self.task_events.setdefault(task_id, asyncio.Event())
             event.set()
@@ -713,6 +727,7 @@ class DownloadManager:
                 details=json.dumps(
                     {
                         "_cancelled": sorted(self.get_cancelled_chapters(task_id)),
+                        "_auto_retries": auto_retries,
                         "_meta": {"phase": "extracting", "completed": 0, "total": 0},
                     }
                 ),
@@ -736,6 +751,7 @@ class DownloadManager:
                     last_extraction_write = now
                     details = {
                         "_cancelled": sorted(self.get_cancelled_chapters(task_id)),
+                        "_auto_retries": auto_retries,
                         "_meta": {**payload, "phase": "extracting"},
                     }
                     await asyncio.to_thread(
@@ -777,6 +793,7 @@ class DownloadManager:
 
                 progress_details = {
                     "_cancelled": sorted(self.get_cancelled_chapters(task_id)),
+                    "_auto_retries": auto_retries,
                     "_meta": {
                         "phase": "downloading",
                         "extraction_seconds": int(extraction_seconds),
@@ -971,6 +988,31 @@ class DownloadManager:
                     else "completed"
                 )
                 cancelled_now = self.get_cancelled_chapters(task_id)
+                if (
+                    final_status == "completed_with_errors"
+                    and auto_retries < MAX_AUTO_RETRIES
+                ):
+                    # Files that already downloaded are skipped on the next
+                    # pass, so it only repeats what failed.
+                    logger.log(
+                        f"Finished with {state['failed']} failed items and "
+                        f"{len(extraction_errors)} extraction errors. "
+                        f"Retrying automatically (attempt {auto_retries + 1} "
+                        f"of {MAX_AUTO_RETRIES})..."
+                    )
+                    await asyncio.to_thread(
+                        _update_task,
+                        task_id,
+                        status="pending",
+                        progress=0.0,
+                        details=json.dumps(
+                            {
+                                "_cancelled": sorted(cancelled_now),
+                                "_auto_retries": auto_retries + 1,
+                            }
+                        ),
+                    )
+                    return True
                 for chapter in cancelled_now:
                     progress_details.pop(chapter, None)
                 progress_details["_cancelled"] = sorted(cancelled_now)

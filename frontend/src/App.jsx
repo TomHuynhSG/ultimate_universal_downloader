@@ -265,6 +265,7 @@ function App() {
   const [url, setUrl] = useState('')
   const [downloads, setDownloads] = useState([])
   const [visibleCount, setVisibleCount] = useState(50)
+  const [searchText, setSearchText] = useState('')
   const [connection, setConnection] = useState('Connecting')
   const [plugins, setPlugins] = useState([])
   const [showPlugins, setShowPlugins] = useState(false)
@@ -413,7 +414,16 @@ function App() {
   }, [])
 
   const deleteTask = useCallback((id) => setDeleteTaskId(id), [])
-  const visibleDownloads = downloads.slice(0, visibleCount)
+  const taskNumbers = useMemo(() => new Map(downloads.map((task, index) => [task.id, downloads.length - index])), [downloads])
+  const filteredDownloads = useMemo(() => {
+    const terms = searchText.toLowerCase().split(/\s+/).filter(Boolean)
+    if (terms.length === 0) return downloads
+    return downloads.filter((task) => {
+      const haystack = [task.title, task.url, task.status, task.id].filter(Boolean).join(' ').toLowerCase()
+      return terms.every((term) => haystack.includes(term))
+    })
+  }, [downloads, searchText])
+  const visibleDownloads = filteredDownloads.slice(0, visibleCount)
 
   return (
     <div className="container" style={{ padding: '0 2rem 2rem', maxWidth: '1200px', margin: '0 auto', zoom: settings.ui_scale || 1 }}>
@@ -449,18 +459,31 @@ function App() {
           <div style={{ display: 'flex', gap: '8px' }}>
             <button className="btn glass-panel" onClick={() => postAction('/downloads/pause-all')}><Pause size={14} /> Pause all</button>
             <button className="btn glass-panel" onClick={() => postAction('/downloads/resume-all')}><Play size={14} /> Resume all</button>
+            <button className="btn glass-panel" onClick={() => postAction('/downloads/retry-failed')} title="Restart every task that finished with errors"><RotateCw size={14} /> Retry failed</button>
             <button className="btn glass-panel" onClick={() => postAction('/downloads/clear-completed')}><CheckCircle2 size={14} /> Clear completed</button>
             <button className="btn glass-panel danger" onClick={async () => { if (window.confirm('Clear task history? Downloaded files are kept.')) await postAction('/downloads/clear-all') }}><Trash2 size={14} /> Clear all</button>
           </div>
         </div>
+        <div className="task-search">
+          <Search size={16} />
+          <input
+            className="input-field"
+            type="search"
+            value={searchText}
+            onChange={(event) => { setSearchText(event.target.value); setVisibleCount(50) }}
+            placeholder="Search tasks by title, URL or status"
+            aria-label="Search tasks"
+          />
+          {searchText && <small>{filteredDownloads.length} of {downloads.length}</small>}
+        </div>
         <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: '12px' }}>
           {visibleDownloads.length === 0 ? (
-            <div className="glass-panel empty-state"><Search size={42} /><p>No tasks yet.</p></div>
-          ) : visibleDownloads.map((task, index) => (
+            <div className="glass-panel empty-state"><Search size={42} /><p>{searchText ? 'No tasks match your search.' : 'No tasks yet.'}</p></div>
+          ) : visibleDownloads.map((task) => (
             <TaskCard
               key={task.id}
               task={task}
-              number={downloads.length - index}
+              number={taskNumbers.get(task.id)}
               onPause={pause}
               onResume={resume}
               onPrioritize={prioritize}
@@ -471,7 +494,7 @@ function App() {
               onDeleteChapter={deleteChapter}
             />
           ))}
-          {visibleCount < downloads.length && <button className="btn glass-panel" onClick={() => setVisibleCount((count) => count + 50)}>Show 50 more</button>}
+          {visibleCount < filteredDownloads.length && <button className="btn glass-panel" onClick={() => setVisibleCount((count) => count + 50)}>Show 50 more</button>}
         </div>
       </main>
 
